@@ -139,7 +139,7 @@ async function streamAndAggregate(
 
     // Only weekly rows.
     const dur = toNum(getCol("period_duration"));
-    if (dur !== 7) continue;
+    if (dur !== 1) continue;
 
     const region = getCol("region") ?? "";
     if (!region) continue;
@@ -174,7 +174,7 @@ async function streamAndAggregate(
     // Parse numeric fields once; reused across window matches.
     const sold = toNum(getCol("homes_sold"));
     const pend = toNum(getCol("pending_sales"));
-    const dom = toNum(getCol("median_days_on_market"));
+    const dom = toNum(getCol("median_dom"));
     const price = toNum(getCol("median_sale_price"));
 
     for (const c of cutoffsMs) {
