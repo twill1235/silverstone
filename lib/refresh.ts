@@ -26,8 +26,12 @@ const WINDOWS: { key: TimeWindow; days: number }[] = [
   { key: "1y", days: 365 }
 ];
 
-/** Redfin's weekly tracker uses rolling 1-week rows; period_duration = 7. */
-const PERIOD_DURATION_WEEKLY = 7;
+/** Redfin's period_duration varies by file. Verified from production logs. */
+const PERIOD_DURATION_BY_GEO: Record<"state" | "county" | "zip", number> = {
+  state: 30,
+  county: 30,
+  zip: 90
+};
 
 function stripQuotes(v: string | undefined): string | undefined {
   if (v == null) return undefined;
@@ -146,7 +150,7 @@ async function streamAndAggregate(
     }
 
     const dur = toNum(durRaw);
-    if (dur !== PERIOD_DURATION_WEEKLY) continue;
+    if (dur !== PERIOD_DURATION_BY_GEO[geoType]) continue;
 
     const region = getCol("region") ?? "";
     if (!region) continue;
