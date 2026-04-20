@@ -2,13 +2,6 @@
 // Pulls Redfin Data Center weekly TSVs (state/county/zip), aggregates per
 // (geo, time-window) in a SINGLE STREAMING PASS to avoid V8's 512MB string
 // cap on the ~1GB uncompressed ZIP file.
-//
-// Pipeline per source:
-//   fetch(url).body  →  gunzip stream  →  readline  →  row-by-row accumulator
-//
-// After the stream ends, we iterate the per-geo accumulator once to emit
-// MarketRow objects. At no point does the full decompressed TSV or the full
-// row set live in memory simultaneously.
 
 import zlib from "node:zlib";
 import { Readable } from "node:stream";
@@ -32,6 +25,14 @@ const WINDOWS: { key: TimeWindow; days: number }[] = [
   { key: "180d", days: 180 },
   { key: "1y", days: 365 }
 ];
+
+/** Redfin's weekly tracker uses rolling 1-week rows; period_duration = 7. */
+const PERIOD_DURATION_WEEKLY = 7;
+
+function stripQuotes(v: string | undefined): string | undefined {
+  if (v == null) return undefined;
+  return v.replace(/^"|"$/g, "");
+}
 
 function toNum(v: string | undefined): number | null {
   if (v == null || v === "" || v === "NA") return null;
@@ -64,8 +65,8 @@ interface Accum {
 interface GeoState {
   name: string;
   stateCode: string;
-  newestAsOf: string;       // max period_end seen
-  newestAsOfMs: number;     // cached for comparison
+  newestAsOf: string;
+  newestAsOfMs: number;
   accs: Map<TimeWindow, Accum>;
 }
 
@@ -82,10 +83,6 @@ function newAccum(): Accum {
   };
 }
 
-/**
- * Stream one Redfin source, aggregating rows in place.
- * Returns a fully-formed array of MarketRow objects for this geoType.
- */
 async function streamAndAggregate(
   url: string,
   geoType: "state" | "county" | "zip"
@@ -97,16 +94,11 @@ async function streamAndAggregate(
     throw new Error(`${url} → ${res.status}`);
   }
 
-  // Precompute window cutoffs once.
   const nowMs = Date.now();
   const cutoffsMs: { key: TimeWindow; cutoffMs: number }[] = WINDOWS.map(
-    (w) => ({
-      key: w.key,
-      cutoffMs: nowMs - w.days * 86_400_000
-    })
+    (w) => ({ key: w.key, cutoffMs: nowMs - w.days * 86_400_000 })
   );
 
-  // Cast web ReadableStream → Node web-stream type, then bridge to a Node Readable.
   const webStream = res.body as unknown as NodeWebReadableStream<Uint8Array>;
   const nodeStream = Readable.fromWeb(webStream);
   const gunzipStream = nodeStream.pipe(zlib.createGunzip());
@@ -118,28 +110,43 @@ async function streamAndAggregate(
   const byGeo = new Map<string, GeoState>();
   let headerIdx: Record<string, number> | null = null;
   let lineNum = 0;
+  let kept = 0;
+  const durationSamples: string[] = [];
 
   for await (const line of rl) {
     lineNum++;
     if (!line) continue;
 
-    // First line: build header → index map.
+    // Header: strip quotes, lowercase for defensive lookup.
     if (headerIdx == null) {
       const cols = line.split("\t");
       headerIdx = {};
-      for (let i = 0; i < cols.length; i++) headerIdx[cols[i]] = i;
+      for (let i = 0; i < cols.length; i++) {
+        const key = (cols[i] ?? "").replace(/^"|"$/g, "").toLowerCase();
+        headerIdx[key] = i;
+      }
+      console.log(
+        `[refresh ${geoType}] header parsed: ${cols.length} cols`
+      );
       continue;
     }
 
     const cells = line.split("\t");
-    const getCol = (name: string) => {
+    const getCol = (name: string): string | undefined => {
       const idx = headerIdx![name];
-      return idx == null ? undefined : cells[idx];
+      if (idx == null) return undefined;
+      return stripQuotes(cells[idx]);
     };
 
-    // Only weekly rows.
-    const dur = toNum(getCol("period_duration"));
-    if (dur !== 1) continue;
+    const durRaw = getCol("period_duration");
+    // One-time diagnostic: capture the first few period_duration values we see
+    // so Vercel logs show the real distribution if the filter ever drops rows.
+    if (durationSamples.length < 5 && durRaw != null) {
+      durationSamples.push(durRaw);
+    }
+
+    const dur = toNum(durRaw);
+    if (dur !== PERIOD_DURATION_WEEKLY) continue;
 
     const region = getCol("region") ?? "";
     if (!region) continue;
@@ -151,8 +158,7 @@ async function streamAndAggregate(
     const periodEndMs = Date.parse(periodEnd);
     if (!Number.isFinite(periodEndMs)) continue;
 
-    const key =
-      geoType === "zip" ? region : `${region}|${stateCode}`;
+    const key = geoType === "zip" ? region : `${region}|${stateCode}`;
 
     let state = byGeo.get(key);
     if (!state) {
@@ -167,18 +173,19 @@ async function streamAndAggregate(
     } else if (periodEndMs > state.newestAsOfMs) {
       state.newestAsOf = periodEnd;
       state.newestAsOfMs = periodEndMs;
-      state.name = region;           // latest reported spelling
+      state.name = region;
       state.stateCode = stateCode;
     }
 
-    // Parse numeric fields once; reused across window matches.
     const sold = toNum(getCol("homes_sold"));
     const pend = toNum(getCol("pending_sales"));
-    const dom = toNum(getCol("median_dom"));
+    const dom = toNum(getCol("median_days_on_market"));
     const price = toNum(getCol("median_sale_price"));
 
+    let matchedAny = false;
     for (const c of cutoffsMs) {
       if (periodEndMs < c.cutoffMs) continue;
+      matchedAny = true;
       let acc = state.accs.get(c.key);
       if (!acc) {
         acc = newAccum();
@@ -199,9 +206,13 @@ async function streamAndAggregate(
         acc.priceWeightTotal += sold;
       }
     }
+    if (matchedAny) kept++;
   }
 
-  // Emit MarketRow objects.
+  console.log(
+    `[refresh ${geoType}] lines=${lineNum} kept=${kept} geos=${byGeo.size} dur_samples=${JSON.stringify(durationSamples)}`
+  );
+
   const out: MarketRow[] = [];
   for (const [key, state] of byGeo) {
     for (const [winKey, acc] of state.accs) {
@@ -278,7 +289,7 @@ async function enrichWithCensus(rows: MarketRow[]): Promise<void> {
       }
     }
   } catch {
-    // non-fatal: dataset is still usable without population
+    // non-fatal
   }
 }
 
