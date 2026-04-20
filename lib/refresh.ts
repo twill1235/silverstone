@@ -1,13 +1,21 @@
 // lib/refresh.ts
 // Pulls Redfin Data Center weekly TSVs (state/county/zip), aggregates per
-// (geo, time-window), enriches with Census population, returns a Dataset.
+// (geo, time-window) in a SINGLE STREAMING PASS to avoid V8's 512MB string
+// cap on the ~1GB uncompressed ZIP file.
+//
+// Pipeline per source:
+//   fetch(url).body  →  gunzip stream  →  readline  →  row-by-row accumulator
+//
+// After the stream ends, we iterate the per-geo accumulator once to emit
+// MarketRow objects. At no point does the full decompressed TSV or the full
+// row set live in memory simultaneously.
 
 import zlib from "node:zlib";
-import { promisify } from "node:util";
+import { Readable } from "node:stream";
+import readline from "node:readline";
+import type { ReadableStream as NodeWebReadableStream } from "node:stream/web";
 import type { MarketRow, TimeWindow } from "./scoring";
 import type { Dataset } from "./data";
-
-const gunzip = promisify(zlib.gunzip);
 
 const SOURCES: Record<"state" | "county" | "zip", string> = {
   state:
@@ -24,29 +32,6 @@ const WINDOWS: { key: TimeWindow; days: number }[] = [
   { key: "180d", days: 180 },
   { key: "1y", days: 365 }
 ];
-
-async function fetchTsv(url: string): Promise<string> {
-  const res = await fetch(url, {
-    headers: { "User-Agent": "silverstone-dashboard/1.0" }
-  });
-  if (!res.ok) throw new Error(`${url} → ${res.status}`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  const unzipped = await gunzip(buf);
-  return unzipped.toString("utf-8");
-}
-
-function parseTsv(text: string): Record<string, string>[] {
-  const lines = text.split(/\r?\n/).filter(Boolean);
-  const header = lines[0].split("\t");
-  const out: Record<string, string>[] = [];
-  for (let i = 1; i < lines.length; i++) {
-    const cells = lines[i].split("\t");
-    const obj: Record<string, string> = {};
-    for (let c = 0; c < header.length; c++) obj[header[c]] = cells[c];
-    out.push(obj);
-  }
-  return out;
-}
 
 function toNum(v: string | undefined): number | null {
   if (v == null || v === "" || v === "NA") return null;
@@ -65,104 +50,193 @@ function cleanRegionName(name: string, geoType: "state" | "county" | "zip") {
   return name.trim();
 }
 
-function aggregateForGeo(
-  rows: Record<string, string>[],
+interface Accum {
+  homesSold: number;
+  pendingSum: number;
+  soldForPending: number;
+  domSum: number;
+  domN: number;
+  domSub60: number;
+  priceVolumeWeightedSum: number;
+  priceWeightTotal: number;
+}
+
+interface GeoState {
+  name: string;
+  stateCode: string;
+  newestAsOf: string;       // max period_end seen
+  newestAsOfMs: number;     // cached for comparison
+  accs: Map<TimeWindow, Accum>;
+}
+
+function newAccum(): Accum {
+  return {
+    homesSold: 0,
+    pendingSum: 0,
+    soldForPending: 0,
+    domSum: 0,
+    domN: 0,
+    domSub60: 0,
+    priceVolumeWeightedSum: 0,
+    priceWeightTotal: 0
+  };
+}
+
+/**
+ * Stream one Redfin source, aggregating rows in place.
+ * Returns a fully-formed array of MarketRow objects for this geoType.
+ */
+async function streamAndAggregate(
+  url: string,
   geoType: "state" | "county" | "zip"
-): MarketRow[] {
-  const byGeo = new Map<string, Record<string, string>[]>();
-  for (const r of rows) {
-    const dur = toNum(r.period_duration);
-    if (dur !== 7) continue;
-    const key =
-      geoType === "zip"
-        ? r.region
-        : `${r.region}|${r.state_code || r.state}`;
-    if (!key) continue;
-    if (!byGeo.has(key)) byGeo.set(key, []);
-    byGeo.get(key)!.push(r);
+): Promise<MarketRow[]> {
+  const res = await fetch(url, {
+    headers: { "User-Agent": "silverstone-dashboard/1.0" }
+  });
+  if (!res.ok || !res.body) {
+    throw new Error(`${url} → ${res.status}`);
   }
 
-  const today = new Date();
-  const results: MarketRow[] = [];
+  // Precompute window cutoffs once.
+  const nowMs = Date.now();
+  const cutoffsMs: { key: TimeWindow; cutoffMs: number }[] = WINDOWS.map(
+    (w) => ({
+      key: w.key,
+      cutoffMs: nowMs - w.days * 86_400_000
+    })
+  );
 
-  for (const [key, weeks] of byGeo) {
-    weeks.sort(
-      (a, b) =>
-        new Date(b.period_end).getTime() - new Date(a.period_end).getTime()
-    );
-    const newest = weeks[0];
-    if (!newest) continue;
-    const asOf = newest.period_end;
+  // Cast web ReadableStream → Node web-stream type, then bridge to a Node Readable.
+  const webStream = res.body as unknown as NodeWebReadableStream<Uint8Array>;
+  const nodeStream = Readable.fromWeb(webStream);
+  const gunzipStream = nodeStream.pipe(zlib.createGunzip());
+  const rl = readline.createInterface({
+    input: gunzipStream,
+    crlfDelay: Infinity
+  });
 
-    for (const w of WINDOWS) {
-      const cutoff = new Date(today);
-      cutoff.setDate(cutoff.getDate() - w.days);
-      const slice = weeks.filter(
-        (x) => new Date(x.period_end) >= cutoff
-      );
-      if (slice.length === 0) continue;
+  const byGeo = new Map<string, GeoState>();
+  let headerIdx: Record<string, number> | null = null;
+  let lineNum = 0;
 
-      let homesSold = 0;
-      let pendingSum = 0;
-      let soldForPending = 0;
-      let domSum = 0;
-      let domN = 0;
-      let domSub60 = 0;
-      let priceVolumeWeightedSum = 0; // Σ(weekly_median × weekly_homes_sold)
-      let priceWeightTotal = 0;       // Σ(weekly_homes_sold) for weeks with valid price
+  for await (const line of rl) {
+    lineNum++;
+    if (!line) continue;
 
-      for (const x of slice) {
-        const sold = toNum(x.homes_sold);
-        const pend = toNum(x.pending_sales);
-        const dom = toNum(x.median_days_on_market);
-        const price = toNum(x.median_sale_price);
-        if (sold != null) homesSold += sold;
-        if (pend != null && sold != null && sold > 0) {
-          pendingSum += pend;
-          soldForPending += sold;
-        }
-        if (dom != null) {
-          domSum += dom;
-          domN++;
-          if (dom < 60) domSub60++;
-        }
-        if (price != null && sold != null && sold > 0) {
-          priceVolumeWeightedSum += price * sold;
-          priceWeightTotal += sold;
-        }
+    // First line: build header → index map.
+    if (headerIdx == null) {
+      const cols = line.split("\t");
+      headerIdx = {};
+      for (let i = 0; i < cols.length; i++) headerIdx[cols[i]] = i;
+      continue;
+    }
+
+    const cells = line.split("\t");
+    const getCol = (name: string) => {
+      const idx = headerIdx![name];
+      return idx == null ? undefined : cells[idx];
+    };
+
+    // Only weekly rows.
+    const dur = toNum(getCol("period_duration"));
+    if (dur !== 7) continue;
+
+    const region = getCol("region") ?? "";
+    if (!region) continue;
+
+    const stateCode = getCol("state_code") || getCol("state") || "";
+    const periodEnd = getCol("period_end") ?? "";
+    if (!periodEnd) continue;
+
+    const periodEndMs = Date.parse(periodEnd);
+    if (!Number.isFinite(periodEndMs)) continue;
+
+    const key =
+      geoType === "zip" ? region : `${region}|${stateCode}`;
+
+    let state = byGeo.get(key);
+    if (!state) {
+      state = {
+        name: region,
+        stateCode,
+        newestAsOf: periodEnd,
+        newestAsOfMs: periodEndMs,
+        accs: new Map()
+      };
+      byGeo.set(key, state);
+    } else if (periodEndMs > state.newestAsOfMs) {
+      state.newestAsOf = periodEnd;
+      state.newestAsOfMs = periodEndMs;
+      state.name = region;           // latest reported spelling
+      state.stateCode = stateCode;
+    }
+
+    // Parse numeric fields once; reused across window matches.
+    const sold = toNum(getCol("homes_sold"));
+    const pend = toNum(getCol("pending_sales"));
+    const dom = toNum(getCol("median_days_on_market"));
+    const price = toNum(getCol("median_sale_price"));
+
+    for (const c of cutoffsMs) {
+      if (periodEndMs < c.cutoffMs) continue;
+      let acc = state.accs.get(c.key);
+      if (!acc) {
+        acc = newAccum();
+        state.accs.set(c.key, acc);
       }
+      if (sold != null) acc.homesSold += sold;
+      if (pend != null && sold != null && sold > 0) {
+        acc.pendingSum += pend;
+        acc.soldForPending += sold;
+      }
+      if (dom != null) {
+        acc.domSum += dom;
+        acc.domN++;
+        if (dom < 60) acc.domSub60++;
+      }
+      if (price != null && sold != null && sold > 0) {
+        acc.priceVolumeWeightedSum += price * sold;
+        acc.priceWeightTotal += sold;
+      }
+    }
+  }
 
+  // Emit MarketRow objects.
+  const out: MarketRow[] = [];
+  for (const [key, state] of byGeo) {
+    for (const [winKey, acc] of state.accs) {
       const pending_pct =
-        soldForPending > 0 ? (pendingSum / soldForPending) * 100 : 0;
-      const median_dom = domN > 0 ? domSum / domN : 0;
-      const dom_sub60_share = domN > 0 ? domSub60 / domN : 0;
-      // Volume-weighted average of weekly medians: weeks with more sales count more.
+        acc.soldForPending > 0
+          ? (acc.pendingSum / acc.soldForPending) * 100
+          : 0;
+      const median_dom = acc.domN > 0 ? acc.domSum / acc.domN : 0;
+      const dom_sub60_share = acc.domN > 0 ? acc.domSub60 / acc.domN : 0;
       const median_sale_price =
-        priceWeightTotal > 0 ? priceVolumeWeightedSum / priceWeightTotal : null;
+        acc.priceWeightTotal > 0
+          ? acc.priceVolumeWeightedSum / acc.priceWeightTotal
+          : null;
 
-      const name = newest.region || "";
-      const stateCode = newest.state_code || newest.state || "";
       const geoId =
-        geoType === "zip" ? name.replace(/[^\d]/g, "") : key;
+        geoType === "zip" ? state.name.replace(/[^\d]/g, "") : key;
 
-      results.push({
+      out.push({
         geo_type: geoType,
         geo_id: geoId,
-        name: cleanRegionName(name, geoType),
-        state: stateCode,
+        name: cleanRegionName(state.name, geoType),
+        state: state.stateCode,
         population: null,
         median_sale_price,
         pending_pct: round(pending_pct, 2),
         median_dom: round(median_dom, 1),
         dom_sub60_share: round(dom_sub60_share, 3),
-        homes_sold: Math.round(homesSold),
-        window: w.key,
-        as_of: asOf
+        homes_sold: Math.round(acc.homesSold),
+        window: winKey,
+        as_of: state.newestAsOf
       });
     }
   }
 
-  return results;
+  return out;
 }
 
 async function enrichWithCensus(rows: MarketRow[]): Promise<void> {
@@ -232,9 +306,8 @@ function buildStateNameMap(): Map<string, string> {
 export async function buildDataset(): Promise<Dataset> {
   const all: MarketRow[] = [];
   for (const geo of ["state", "county", "zip"] as const) {
-    const tsv = await fetchTsv(SOURCES[geo]);
-    const parsed = parseTsv(tsv);
-    all.push(...aggregateForGeo(parsed, geo));
+    const rows = await streamAndAggregate(SOURCES[geo], geo);
+    all.push(...rows);
   }
   await enrichWithCensus(all);
   return {
