@@ -262,7 +262,7 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
       </section>
 
       <footer className="foot">
-        <span>© Silverstone Market Intelligence · editorial build</span>
+        <span>© Silverstone Market Intelligence · Published by Tyler Williams</span>
         <span>Source: {meta.source}</span>
       </footer>
     </div>
