@@ -238,7 +238,7 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
         <div className="section-head">
           <span className="section-num">§ 03</span>
           <h2 className="section-title">Marketing spend insights — all states</h2>
-          <span className="section-note">Equal-weighted score · Pending % + DOM sub-60 share</span>
+          <span className="section-note">Pending % + DOM, weighted by homes sold (so small states don't dominate)</span>
         </div>
         <div className="legend">
           <span><strong>Pending %:</strong> pending sales ÷ inventory, 90-day avg (3 monthly snapshots, All Residential)</span>
