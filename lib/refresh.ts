@@ -3,6 +3,9 @@
 // 512MB string cap on the ~1GB ZIP file), picks the MOST RECENT row per geo,
 // and emits Redfin's pre-computed values directly. Time-window keys exist for
 // UI compatibility but all carry the same underlying Redfin snapshot.
+//
+// "Pending %" in the UI = pending_sales ÷ inventory × 100, i.e. the percentage
+// of active listings currently under contract (including accepting backup offers).
 
 import zlib from "node:zlib";
 import { Readable } from "node:stream";
@@ -57,7 +60,8 @@ interface Snap {
   asOf: string;
   asOfMs: number;
   homesSold: number;
-  pendingSales: number | null;
+  pendingSales: number | null;  // homes under contract (incl. backup offers)
+  inventory: number | null;     // active listings currently for sale
   medianDom: number | null;
   medianSalePrice: number | null;
 }
@@ -121,6 +125,7 @@ async function streamAndAggregate(
 
     const homesSoldNum = toNum(getCol("homes_sold")) ?? 0;
     const pendingSalesNum = toNum(getCol("pending_sales"));
+    const inventoryNum = toNum(getCol("inventory"));
     const medianDomNum = toNum(getCol("median_dom"));
     const medianSalePriceNum = toNum(getCol("median_sale_price"));
 
@@ -131,6 +136,7 @@ async function streamAndAggregate(
       asOfMs: periodEndMs,
       homesSold: Math.round(homesSoldNum),
       pendingSales: pendingSalesNum,
+      inventory: inventoryNum,
       medianDom: medianDomNum,
       medianSalePrice: medianSalePriceNum
     });
@@ -142,8 +148,8 @@ async function streamAndAggregate(
   const out: MarketRow[] = [];
   for (const [key, s] of byGeo) {
     const pending_pct =
-      s.pendingSales != null && s.homesSold > 0
-        ? (s.pendingSales / s.homesSold) * 100
+      s.pendingSales != null && s.inventory != null && s.inventory > 0
+        ? (s.pendingSales / s.inventory) * 100
         : 0;
     const median_dom = s.medianDom ?? 0;
     const dom_sub60_share =
