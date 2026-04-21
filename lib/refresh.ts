@@ -1,7 +1,8 @@
 // lib/refresh.ts
-// Pulls Redfin Data Center weekly TSVs (state/county/zip), aggregates per
-// (geo, time-window) in a SINGLE STREAMING PASS to avoid V8's 512MB string
-// cap on the ~1GB uncompressed ZIP file.
+// Pulls Redfin Data Center TSVs (state/county/zip), streams them (avoids V8's
+// 512MB string cap on the ~1GB ZIP file), picks the MOST RECENT row per geo,
+// and emits Redfin's pre-computed values directly. Time-window keys exist for
+// UI compatibility but all carry the same underlying Redfin snapshot.
 
 import zlib from "node:zlib";
 import { Readable } from "node:stream";
@@ -19,14 +20,9 @@ const SOURCES: Record<"state" | "county" | "zip", string> = {
     "https://redfin-public-data.s3.us-west-2.amazonaws.com/redfin_market_tracker/zip_code_market_tracker.tsv000.gz"
 };
 
-const WINDOWS: { key: TimeWindow; days: number }[] = [
-  { key: "30d", days: 30 },
-  { key: "90d", days: 90 },
-  { key: "180d", days: 180 },
-  { key: "1y", days: 365 }
-];
+const WINDOW_KEYS: TimeWindow[] = ["30d", "90d", "180d", "1y"];
 
-/** Redfin's period_duration varies by file. Verified from production logs. */
+/** period_duration Redfin uses per file; verified from production logs. */
 const PERIOD_DURATION_BY_GEO: Record<"state" | "county" | "zip", number> = {
   state: 30,
   county: 30,
@@ -55,36 +51,15 @@ function cleanRegionName(name: string, geoType: "state" | "county" | "zip") {
   return name.trim();
 }
 
-interface Accum {
-  homesSold: number;
-  pendingSum: number;
-  soldForPending: number;
-  domSum: number;
-  domN: number;
-  domSub60: number;
-  priceVolumeWeightedSum: number;
-  priceWeightTotal: number;
-}
-
-interface GeoState {
+interface Snap {
   name: string;
   stateCode: string;
-  newestAsOf: string;
-  newestAsOfMs: number;
-  accs: Map<TimeWindow, Accum>;
-}
-
-function newAccum(): Accum {
-  return {
-    homesSold: 0,
-    pendingSum: 0,
-    soldForPending: 0,
-    domSum: 0,
-    domN: 0,
-    domSub60: 0,
-    priceVolumeWeightedSum: 0,
-    priceWeightTotal: 0
-  };
+  asOf: string;
+  asOfMs: number;
+  homesSold: number;
+  pendingSales: number | null;
+  medianDom: number | null;
+  medianSalePrice: number | null;
 }
 
 async function streamAndAggregate(
@@ -94,34 +69,22 @@ async function streamAndAggregate(
   const res = await fetch(url, {
     headers: { "User-Agent": "silverstone-dashboard/1.0" }
   });
-  if (!res.ok || !res.body) {
-    throw new Error(`${url} → ${res.status}`);
-  }
-
-  const nowMs = Date.now();
-  const cutoffsMs: { key: TimeWindow; cutoffMs: number }[] = WINDOWS.map(
-    (w) => ({ key: w.key, cutoffMs: nowMs - w.days * 86_400_000 })
-  );
+  if (!res.ok || !res.body) throw new Error(`${url} → ${res.status}`);
 
   const webStream = res.body as unknown as NodeWebReadableStream<Uint8Array>;
   const nodeStream = Readable.fromWeb(webStream);
   const gunzipStream = nodeStream.pipe(zlib.createGunzip());
-  const rl = readline.createInterface({
-    input: gunzipStream,
-    crlfDelay: Infinity
-  });
+  const rl = readline.createInterface({ input: gunzipStream, crlfDelay: Infinity });
 
-  const byGeo = new Map<string, GeoState>();
+  const byGeo = new Map<string, Snap>();
   let headerIdx: Record<string, number> | null = null;
   let lineNum = 0;
   let kept = 0;
-  const durationSamples: string[] = [];
 
   for await (const line of rl) {
     lineNum++;
     if (!line) continue;
 
-    // Header: strip quotes, lowercase for defensive lookup.
     if (headerIdx == null) {
       const cols = line.split("\t");
       headerIdx = {};
@@ -129,9 +92,7 @@ async function streamAndAggregate(
         const key = (cols[i] ?? "").replace(/^"|"$/g, "").toLowerCase();
         headerIdx[key] = i;
       }
-      console.log(
-        `[refresh ${geoType}] header parsed: ${cols.length} cols`
-      );
+      console.log(`[refresh ${geoType}] header parsed: ${cols.length} cols`);
       continue;
     }
 
@@ -142,14 +103,7 @@ async function streamAndAggregate(
       return stripQuotes(cells[idx]);
     };
 
-    const durRaw = getCol("period_duration");
-    // One-time diagnostic: capture the first few period_duration values we see
-    // so Vercel logs show the real distribution if the filter ever drops rows.
-    if (durationSamples.length < 5 && durRaw != null) {
-      durationSamples.push(durRaw);
-    }
-
-    const dur = toNum(durRaw);
+    const dur = toNum(getCol("period_duration"));
     if (dur !== PERIOD_DURATION_BY_GEO[geoType]) continue;
 
     const region = getCol("region") ?? "";
@@ -158,95 +112,60 @@ async function streamAndAggregate(
     const stateCode = getCol("state_code") || getCol("state") || "";
     const periodEnd = getCol("period_end") ?? "";
     if (!periodEnd) continue;
-
     const periodEndMs = Date.parse(periodEnd);
     if (!Number.isFinite(periodEndMs)) continue;
 
     const key = geoType === "zip" ? region : `${region}|${stateCode}`;
+    const existing = byGeo.get(key);
+    if (existing && periodEndMs <= existing.asOfMs) continue;
 
-    let state = byGeo.get(key);
-    if (!state) {
-      state = {
-        name: region,
-        stateCode,
-        newestAsOf: periodEnd,
-        newestAsOfMs: periodEndMs,
-        accs: new Map()
-      };
-      byGeo.set(key, state);
-    } else if (periodEndMs > state.newestAsOfMs) {
-      state.newestAsOf = periodEnd;
-      state.newestAsOfMs = periodEndMs;
-      state.name = region;
-      state.stateCode = stateCode;
-    }
+    const homesSoldNum = toNum(getCol("homes_sold")) ?? 0;
+    const pendingSalesNum = toNum(getCol("pending_sales"));
+    const medianDomNum = toNum(getCol("median_dom"));
+    const medianSalePriceNum = toNum(getCol("median_sale_price"));
 
-    const sold = toNum(getCol("homes_sold"));
-    const pend = toNum(getCol("pending_sales"));
-    const dom = toNum(getCol("median_days_on_market"));
-    const price = toNum(getCol("median_sale_price"));
-
-    let matchedAny = false;
-    for (const c of cutoffsMs) {
-      if (periodEndMs < c.cutoffMs) continue;
-      matchedAny = true;
-      let acc = state.accs.get(c.key);
-      if (!acc) {
-        acc = newAccum();
-        state.accs.set(c.key, acc);
-      }
-      if (sold != null) acc.homesSold += sold;
-      if (pend != null && sold != null && sold > 0) {
-        acc.pendingSum += pend;
-        acc.soldForPending += sold;
-      }
-      if (dom != null) {
-        acc.domSum += dom;
-        acc.domN++;
-        if (dom < 60) acc.domSub60++;
-      }
-      if (price != null && sold != null && sold > 0) {
-        acc.priceVolumeWeightedSum += price * sold;
-        acc.priceWeightTotal += sold;
-      }
-    }
-    if (matchedAny) kept++;
+    byGeo.set(key, {
+      name: region,
+      stateCode,
+      asOf: periodEnd,
+      asOfMs: periodEndMs,
+      homesSold: Math.round(homesSoldNum),
+      pendingSales: pendingSalesNum,
+      medianDom: medianDomNum,
+      medianSalePrice: medianSalePriceNum
+    });
+    kept++;
   }
 
-  console.log(
-    `[refresh ${geoType}] lines=${lineNum} kept=${kept} geos=${byGeo.size} dur_samples=${JSON.stringify(durationSamples)}`
-  );
+  console.log(`[refresh ${geoType}] lines=${lineNum} kept=${kept} geos=${byGeo.size}`);
 
   const out: MarketRow[] = [];
-  for (const [key, state] of byGeo) {
-    for (const [winKey, acc] of state.accs) {
-      const pending_pct =
-        acc.soldForPending > 0
-          ? (acc.pendingSum / acc.soldForPending) * 100
-          : 0;
-      const median_dom = acc.domN > 0 ? acc.domSum / acc.domN : 0;
-      const dom_sub60_share = acc.domN > 0 ? acc.domSub60 / acc.domN : 0;
-      const median_sale_price =
-        acc.priceWeightTotal > 0
-          ? acc.priceVolumeWeightedSum / acc.priceWeightTotal
-          : null;
+  for (const [key, s] of byGeo) {
+    const pending_pct =
+      s.pendingSales != null && s.homesSold > 0
+        ? (s.pendingSales / s.homesSold) * 100
+        : 0;
+    const median_dom = s.medianDom ?? 0;
+    const dom_sub60_share =
+      s.medianDom != null ? (s.medianDom < 60 ? 1 : 0) : 0;
 
-      const geoId =
-        geoType === "zip" ? state.name.replace(/[^\d]/g, "") : key;
+    const geoId = geoType === "zip" ? s.name.replace(/[^\d]/g, "") : key;
+    const cleanedName = cleanRegionName(s.name, geoType);
 
+    for (const winKey of WINDOW_KEYS) {
       out.push({
         geo_type: geoType,
         geo_id: geoId,
-        name: cleanRegionName(state.name, geoType),
-        state: state.stateCode,
+        name: cleanedName,
+        state: s.stateCode,
         population: null,
-        median_sale_price,
+        median_sale_price: s.medianSalePrice,
         pending_pct: round(pending_pct, 2),
         median_dom: round(median_dom, 1),
-        dom_sub60_share: round(dom_sub60_share, 3),
-        homes_sold: Math.round(acc.homesSold),
+        dom_sub60_share,
+        homes_sold: s.homesSold,
         window: winKey,
-        as_of: state.newestAsOf
+        as_of: s.asOf
       });
     }
   }
@@ -256,6 +175,7 @@ async function streamAndAggregate(
 
 async function enrichWithCensus(rows: MarketRow[]): Promise<void> {
   try {
+    // ----- States -----
     const stateRes = await fetch(
       "https://api.census.gov/data/2022/acs/acs5?get=NAME,B01003_001E&for=state:*"
     );
@@ -265,14 +185,21 @@ async function enrichWithCensus(rows: MarketRow[]): Promise<void> {
       for (let i = 1; i < arr.length; i++) {
         statePop.set(arr[i][0].toUpperCase(), Number(arr[i][1]));
       }
+      let stateMatched = 0;
       for (const r of rows) {
-        if (r.geo_type === "state") {
-          const p = statePop.get(r.name.toUpperCase());
-          if (p != null) r.population = p;
+        if (r.geo_type !== "state") continue;
+        const p = statePop.get(r.name.toUpperCase());
+        if (p != null) {
+          r.population = p;
+          stateMatched++;
         }
       }
+      console.log(`[census] states matched: ${stateMatched}`);
+    } else {
+      console.warn(`[census] state fetch failed: ${stateRes.status}`);
     }
 
+    // ----- Counties -----
     const countyRes = await fetch(
       "https://api.census.gov/data/2022/acs/acs5?get=NAME,B01003_001E&for=county:*"
     );
@@ -280,20 +207,46 @@ async function enrichWithCensus(rows: MarketRow[]): Promise<void> {
       const arr = (await countyRes.json()) as string[][];
       const countyPop = new Map<string, number>();
       for (let i = 1; i < arr.length; i++) {
-        countyPop.set(arr[i][0].toLowerCase(), Number(arr[i][1]));
+        const full = arr[i][0];
+        const pop = Number(arr[i][1]);
+        const lower = full.toLowerCase();
+        countyPop.set(lower, pop);
+        const stripped = lower
+          .replace(/\s+county,/, ",")
+          .replace(/\s+parish,/, ",")
+          .replace(/\s+borough,/, ",")
+          .replace(/\s+census area,/, ",")
+          .replace(/\s+municipality,/, ",")
+          .replace(/\s+city and borough,/, ",")
+          .replace(/\s+city,/, ",");
+        if (stripped !== lower) countyPop.set(stripped, pop);
       }
       const stateNameByCode = buildStateNameMap();
+      let countyMatched = 0;
       for (const r of rows) {
         if (r.geo_type !== "county") continue;
         const stateName = stateNameByCode.get(r.state.toUpperCase());
         if (!stateName) continue;
-        const key = `${r.name}, ${stateName}`.toLowerCase();
-        const p = countyPop.get(key);
-        if (p != null) r.population = p;
+        const rawKey = `${r.name}, ${stateName}`.toLowerCase();
+        const strippedKey = rawKey
+          .replace(/\s+county,/, ",")
+          .replace(/\s+parish,/, ",")
+          .replace(/\s+borough,/, ",")
+          .replace(/\s+census area,/, ",")
+          .replace(/\s+municipality,/, ",")
+          .replace(/\s+city and borough,/, ",");
+        const p = countyPop.get(rawKey) ?? countyPop.get(strippedKey);
+        if (p != null) {
+          r.population = p;
+          countyMatched++;
+        }
       }
+      console.log(`[census] counties matched: ${countyMatched}`);
+    } else {
+      console.warn(`[census] county fetch failed: ${countyRes.status}`);
     }
-  } catch {
-    // non-fatal
+  } catch (e: unknown) {
+    console.warn(`[census] enrichment error: ${(e as Error).message}`);
   }
 }
 
