@@ -224,13 +224,16 @@ async function streamAndAggregate(
       return n > 0 ? sum / n : null;
     };
 
-    // Pending % per snapshot = pending_sales / active_listings * 100.
-    // Then average those per-snapshot percentages across the 3 monthly snapshots.
+    // Pending % per snapshot = pending_sales / inventory * 100.
+    // For ZIP, Redfin publishes 90-day rolling data (vs 30-day for state/county).
+    // Dividing ZIP's pending_sales by 3 gives a monthly-equivalent pending count,
+    // so ZIP pending % is comparable to state/county.
+    const pendingDivisor = geoType === "zip" ? 3 : 1;
     const pendingAvg = avg((x) => {
       if (x.pendingSales == null || x.activeListings == null || x.activeListings <= 0) {
         return null;
       }
-      return (x.pendingSales / x.activeListings) * 100;
+      return ((x.pendingSales / pendingDivisor) / x.activeListings) * 100;
     });
     const soldAboveAvg = avg((x) => x.soldAboveListPct);
     const domAvg = avg((x) => x.medianDom);
@@ -374,7 +377,7 @@ function buildStateNameMap(): Map<string, string> {
 }
 
 export async function buildDataset(): Promise<Dataset> {
-  console.log("[refresh] buildDataset v=pending-over-inventory-allres-90d");
+  console.log("[refresh] buildDataset v=pending-over-inventory-zip-norm");
   const all: MarketRow[] = [];
   for (const geo of ["state", "county", "zip"] as const) {
     const rows = await streamAndAggregate(SOURCES[geo], geo);
