@@ -4,10 +4,9 @@
 // most-recent monthly snapshots (spaced ≥25 days apart). All output fields are
 // AVERAGED across those three snapshots to produce stable 90-day trends.
 //
-// "Pending %" = 90-day average of (pending_sales ÷ active_listings × 100),
-// computed per monthly snapshot then averaged across the 3 snapshots.
-// Answers: "of all homes that were active on the market during the month, what
-// share went pending during the month?" Real 0-100% absorption metric.
+// "Pending %" = 90-day average of (pending_sales ÷ inventory × 100), computed
+// per monthly snapshot then averaged across the 3 snapshots. Filtered to
+// property_type = "All Residential" so numbers match totals on redfin.com.
 
 import zlib from "node:zlib";
 import { Readable } from "node:stream";
@@ -122,6 +121,12 @@ async function streamAndAggregate(
     const dur = toNum(getCol("period_duration"));
     if (dur !== PERIOD_DURATION_BY_GEO[geoType]) continue;
 
+    // Redfin publishes 5 property-type breakouts per (geo, period). We only
+    // want the aggregate — "All Residential" — so the numbers match the
+    // totals you'd see on redfin.com.
+    const propertyType = getCol("property_type");
+    if (propertyType !== "All Residential") continue;
+
     const region = getCol("region") ?? "";
     if (!region) continue;
 
@@ -135,7 +140,7 @@ async function streamAndAggregate(
 
     const homesSoldNum = toNum(getCol("homes_sold")) ?? 0;
     const pendingSalesNum = toNum(getCol("pending_sales"));
-    const activeListingsNum = toNum(getCol("active_listings"));
+    const inventoryNum = toNum(getCol("inventory"));
     const soldAboveRaw = toNum(getCol("sold_above_list"));
     const medianDomNum = toNum(getCol("median_dom"));
     const medianSalePriceNum = toNum(getCol("median_sale_price"));
@@ -150,7 +155,7 @@ async function streamAndAggregate(
       asOfMs: periodEndMs,
       homesSold: Math.round(homesSoldNum),
       pendingSales: pendingSalesNum,
-      activeListings: activeListingsNum,
+      activeListings: inventoryNum, // Redfin's INVENTORY column
       soldAboveListPct: normalizePct(soldAboveRaw),
       medianDom: medianDomNum,
       medianSalePrice: medianSalePriceNum
@@ -369,7 +374,7 @@ function buildStateNameMap(): Map<string, string> {
 }
 
 export async function buildDataset(): Promise<Dataset> {
-  console.log("[refresh] buildDataset v=pending-over-active-90d");
+  console.log("[refresh] buildDataset v=pending-over-inventory-allres-90d");
   const all: MarketRow[] = [];
   for (const geo of ["state", "county", "zip"] as const) {
     const rows = await streamAndAggregate(SOURCES[geo], geo);
