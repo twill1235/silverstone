@@ -4,8 +4,9 @@
 // and emits Redfin's pre-computed values directly. Time-window keys exist for
 // UI compatibility but all carry the same underlying Redfin snapshot.
 //
-// "Pending %" in the UI = pending_sales ÷ inventory × 100, i.e. the percentage
-// of active listings currently under contract (including accepting backup offers).
+// "Pending %" in the UI = Redfin's `off_market_in_two_weeks` column: the
+// percentage of homes that went under contract within two weeks of listing.
+// Real 0-100% market-heat metric — high = hot market.
 
 import zlib from "node:zlib";
 import { Readable } from "node:stream";
@@ -60,8 +61,7 @@ interface Snap {
   asOf: string;
   asOfMs: number;
   homesSold: number;
-  pendingSales: number | null;  // homes under contract (incl. backup offers)
-  inventory: number | null;     // active listings currently for sale
+  offMarketInTwoWeeksPct: number | null; // 0-100
   medianDom: number | null;
   medianSalePrice: number | null;
 }
@@ -124,10 +124,16 @@ async function streamAndAggregate(
     if (existing && periodEndMs <= existing.asOfMs) continue;
 
     const homesSoldNum = toNum(getCol("homes_sold")) ?? 0;
-    const pendingSalesNum = toNum(getCol("pending_sales"));
-    const inventoryNum = toNum(getCol("inventory"));
+    const offMarketRaw = toNum(getCol("off_market_in_two_weeks"));
     const medianDomNum = toNum(getCol("median_dom"));
     const medianSalePriceNum = toNum(getCol("median_sale_price"));
+
+    // Redfin publishes off_market_in_two_weeks as a 0-1 fraction. Normalize to 0-100.
+    // Defensive: if a row is already >1, assume it's already percent-scaled.
+    let offMarketPct: number | null = null;
+    if (offMarketRaw != null) {
+      offMarketPct = offMarketRaw <= 1 ? offMarketRaw * 100 : offMarketRaw;
+    }
 
     byGeo.set(key, {
       name: region,
@@ -135,8 +141,7 @@ async function streamAndAggregate(
       asOf: periodEnd,
       asOfMs: periodEndMs,
       homesSold: Math.round(homesSoldNum),
-      pendingSales: pendingSalesNum,
-      inventory: inventoryNum,
+      offMarketInTwoWeeksPct: offMarketPct,
       medianDom: medianDomNum,
       medianSalePrice: medianSalePriceNum
     });
@@ -147,10 +152,7 @@ async function streamAndAggregate(
 
   const out: MarketRow[] = [];
   for (const [key, s] of byGeo) {
-    const pending_pct =
-      s.pendingSales != null && s.inventory != null && s.inventory > 0
-        ? (s.pendingSales / s.inventory) * 100
-        : 0;
+    const pending_pct = s.offMarketInTwoWeeksPct ?? 0;
     const median_dom = s.medianDom ?? 0;
     const dom_sub60_share =
       s.medianDom != null ? (s.medianDom < 60 ? 1 : 0) : 0;
@@ -278,6 +280,7 @@ function buildStateNameMap(): Map<string, string> {
 }
 
 export async function buildDataset(): Promise<Dataset> {
+  console.log("[refresh] buildDataset v=offmarket-2wk");
   const all: MarketRow[] = [];
   for (const geo of ["state", "county", "zip"] as const) {
     const rows = await streamAndAggregate(SOURCES[geo], geo);
