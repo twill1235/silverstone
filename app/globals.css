@@ -228,6 +228,17 @@ body {
   color: var(--bg);
 }
 .window-bar button:hover:not(.active) { background: var(--bg-elev); color: var(--ink); }
+.window-bar button.disabled,
+.window-bar button:disabled {
+  color: var(--line-soft);
+  cursor: not-allowed;
+  opacity: 0.55;
+  text-decoration: line-through;
+  text-decoration-color: var(--line-soft);
+  text-decoration-thickness: 1px;
+}
+.window-bar button.disabled:hover,
+.window-bar button:disabled:hover { background: transparent; color: var(--line-soft); }
 
 /* RESULT CARD */
 .result {
@@ -326,6 +337,15 @@ table.data tbody td {
 }
 table.data tbody tr:last-child td { border-bottom: none; }
 table.data tbody tr:hover { background: rgba(184, 66, 30, 0.04); }
+table.data thead th.sortable {
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.12s ease, background 0.12s ease;
+}
+table.data thead th.sortable:hover {
+  color: var(--accent);
+  background: var(--bg-elev);
+}
 table.data .rank {
   font-family: "JetBrains Mono", monospace;
   color: var(--ink-3);
