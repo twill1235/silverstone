@@ -197,20 +197,26 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
         <div className="section-head">
           <span className="section-num">§ 02</span>
           <h2 className="section-title">Time window</h2>
-          <span className="section-note">Applies to all search results, rankings, and the state marketing table.</span>
+          <span className="section-note">Applies to all search results, rankings, and the state marketing table. Redfin publishes at 30-day (state/county) and 90-day (ZIP) rolling windows — longer windows are unavailable.</span>
         </div>
         <div className="window-bar" role="radiogroup" aria-label="Time window">
-          {(Object.keys(WINDOW_LABELS) as TimeWindow[]).map((k) => (
-            <button
-              key={k}
-              className={win === k ? "active" : ""}
-              onClick={() => setWin(k)}
-              aria-checked={win === k}
-              role="radio"
-            >
-              {WINDOW_LABELS[k]}
-            </button>
-          ))}
+          {(Object.keys(WINDOW_LABELS) as TimeWindow[]).map((k) => {
+            const disabled = k === "180d" || k === "1y";
+            return (
+              <button
+                key={k}
+                className={`${win === k ? "active" : ""}${disabled ? " disabled" : ""}`}
+                onClick={() => { if (!disabled) setWin(k); }}
+                aria-checked={win === k}
+                aria-disabled={disabled}
+                role="radio"
+                disabled={disabled}
+                title={disabled ? "Not published by Redfin" : undefined}
+              >
+                {WINDOW_LABELS[k]}
+              </button>
+            );
+          })}
         </div>
       </section>
 
@@ -465,24 +471,77 @@ function TopCountyTable({ rows }: { rows: ScoredRow[] }) {
   );
 }
 
-/** Marketing-spend table — all 50 states, scored on Pending % + DOM only. */
+/** Marketing-spend table — all 50 states, click any column to sort. */
+type StatesSortKey =
+  | "pending_pct"
+  | "median_dom"
+  | "homes_sold"
+  | "median_sale_price"
+  | "marketing_score"
+  | "name";
+
 function StatesTable({ rows }: { rows: ScoredRow[] }) {
+  const [sortKey, setSortKey] = useState<StatesSortKey>("marketing_score");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+
+  function toggleSort(k: StatesSortKey) {
+    if (k === sortKey) {
+      setSortDir((d) => (d === "desc" ? "asc" : "desc"));
+    } else {
+      setSortKey(k);
+      // DOM is "lower = hotter", so default ascending. Name ascending. Others descending.
+      setSortDir(k === "median_dom" || k === "name" ? "asc" : "desc");
+    }
+  }
+
+  const sorted = useMemo(() => {
+    const arr = [...rows];
+    arr.sort((a, b) => {
+      if (sortKey === "name") {
+        const av = a.name.toLowerCase();
+        const bv = b.name.toLowerCase();
+        if (av === bv) return 0;
+        const cmp = av < bv ? -1 : 1;
+        return sortDir === "asc" ? cmp : -cmp;
+      }
+      const av = (a[sortKey] ?? 0) as number;
+      const bv = (b[sortKey] ?? 0) as number;
+      return sortDir === "desc" ? bv - av : av - bv;
+    });
+    return arr;
+  }, [rows, sortKey, sortDir]);
+
+  const arrow = (k: StatesSortKey) =>
+    sortKey === k ? (sortDir === "desc" ? " ↓" : " ↑") : "";
+
   return (
     <div className="table-wrap">
       <table className="data">
         <thead>
           <tr>
             <th className="rank">#</th>
-            <th>State</th>
-            <th className="num">Pending %</th>
-            <th className="num">Avg DOM</th>
-            <th className="num">Homes Sold</th>
-            <th className="num">Avg Sale Price</th>
-            <th className="num">Score</th>
+            <th className="sortable" onClick={() => toggleSort("name")}>
+              State{arrow("name")}
+            </th>
+            <th className="num sortable" onClick={() => toggleSort("pending_pct")}>
+              Pending %{arrow("pending_pct")}
+            </th>
+            <th className="num sortable" onClick={() => toggleSort("median_dom")}>
+              Avg DOM{arrow("median_dom")}
+            </th>
+            <th className="num sortable" onClick={() => toggleSort("homes_sold")}>
+              Homes Sold{arrow("homes_sold")}
+            </th>
+            <th className="num sortable" onClick={() => toggleSort("median_sale_price")}>
+              Avg Sale Price{arrow("median_sale_price")}
+            </th>
+            <th className="num sortable" onClick={() => toggleSort("marketing_score")}>
+              Score{arrow("marketing_score")}
+            </th>
           </tr>
         </thead>
         <tbody>
-          {rows.map((r, i) => (
+          {sorted.map((r, i) => (
             <tr key={`${r.geo_id}-${r.window}-${i}`}>
               <td className="rank">{(i + 1).toString().padStart(2, "0")}</td>
               <td className="name-cell">
