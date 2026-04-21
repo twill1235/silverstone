@@ -4,9 +4,10 @@
 // most-recent monthly snapshots (spaced ≥25 days apart). All output fields are
 // AVERAGED across those three snapshots to produce stable 90-day trends.
 //
-// "Pending %" in the UI = 90-day average of Redfin's `off_market_in_two_weeks`
-// column across the 3 monthly snapshots. A real 0-100% market-heat metric that
-// smooths week-to-week noise.
+// "Pending %" = 90-day average of (pending_sales ÷ active_listings × 100),
+// computed per monthly snapshot then averaged across the 3 snapshots.
+// Answers: "of all homes that were active on the market during the month, what
+// share went pending during the month?" Real 0-100% absorption metric.
 
 import zlib from "node:zlib";
 import { Readable } from "node:stream";
@@ -59,7 +60,8 @@ interface Sample {
   asOf: string;
   asOfMs: number;
   homesSold: number;
-  offMarketInTwoWeeksPct: number | null;
+  pendingSales: number | null;
+  activeListings: number | null;
   soldAboveListPct: number | null;
   medianDom: number | null;
   medianSalePrice: number | null;
@@ -132,14 +134,14 @@ async function streamAndAggregate(
     const key = geoType === "zip" ? region : `${region}|${stateCode}`;
 
     const homesSoldNum = toNum(getCol("homes_sold")) ?? 0;
-    const offMarketRaw = toNum(getCol("off_market_in_two_weeks"));
+    const pendingSalesNum = toNum(getCol("pending_sales"));
+    const activeListingsNum = toNum(getCol("active_listings"));
     const soldAboveRaw = toNum(getCol("sold_above_list"));
     const medianDomNum = toNum(getCol("median_dom"));
     const medianSalePriceNum = toNum(getCol("median_sale_price"));
 
     const normalizePct = (v: number | null): number | null => {
       if (v == null) return null;
-      // Redfin publishes these as 0-1 fractions; defensively handle already-scaled values.
       return v <= 1 ? v * 100 : v;
     };
 
@@ -147,7 +149,8 @@ async function streamAndAggregate(
       asOf: periodEnd,
       asOfMs: periodEndMs,
       homesSold: Math.round(homesSoldNum),
-      offMarketInTwoWeeksPct: normalizePct(offMarketRaw),
+      pendingSales: pendingSalesNum,
+      activeListings: activeListingsNum,
       soldAboveListPct: normalizePct(soldAboveRaw),
       medianDom: medianDomNum,
       medianSalePrice: medianSalePriceNum
@@ -216,11 +219,17 @@ async function streamAndAggregate(
       return n > 0 ? sum / n : null;
     };
 
-    const pendingAvg = avg((x) => x.offMarketInTwoWeeksPct);
+    // Pending % per snapshot = pending_sales / active_listings * 100.
+    // Then average those per-snapshot percentages across the 3 monthly snapshots.
+    const pendingAvg = avg((x) => {
+      if (x.pendingSales == null || x.activeListings == null || x.activeListings <= 0) {
+        return null;
+      }
+      return (x.pendingSales / x.activeListings) * 100;
+    });
     const soldAboveAvg = avg((x) => x.soldAboveListPct);
     const domAvg = avg((x) => x.medianDom);
     const priceAvg = avg((x) => x.medianSalePrice);
-    // homes_sold summed across samples is a meaningful 90-day volume figure.
     let homesSoldTotal = 0;
     for (const sample of s.samples) homesSoldTotal += sample.homesSold;
 
@@ -229,10 +238,9 @@ async function streamAndAggregate(
     const dom_sub60_share = domAvg != null ? (domAvg < 60 ? 1 : 0) : 0;
 
     // Composite Heat Score (0-100): pending + sold-above-list + DOM (inverted).
-    // DOM normalized so 0 days = 100 points, 120+ days = 0 points.
     const domScore = domAvg == null ? 0 : Math.max(0, Math.min(100, 100 - (domAvg / 120) * 100));
     const parts: number[] = [];
-    if (pendingAvg != null) parts.push(pendingAvg);
+    if (pendingAvg != null) parts.push(Math.min(100, pendingAvg));
     if (soldAboveAvg != null) parts.push(soldAboveAvg);
     if (domAvg != null) parts.push(domScore);
     const heatScore = parts.length > 0 ? parts.reduce((a, b) => a + b, 0) / parts.length : 0;
@@ -361,7 +369,7 @@ function buildStateNameMap(): Map<string, string> {
 }
 
 export async function buildDataset(): Promise<Dataset> {
-  console.log("[refresh] buildDataset v=90d-3snapshot-avg");
+  console.log("[refresh] buildDataset v=pending-over-active-90d");
   const all: MarketRow[] = [];
   for (const geo of ["state", "county", "zip"] as const) {
     const rows = await streamAndAggregate(SOURCES[geo], geo);
