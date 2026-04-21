@@ -77,12 +77,33 @@ export function scoreRow(row: MarketRow): ScoredRow {
 }
 
 /**
+ * Volume weight that fades small-market skew without ignoring them entirely.
+ * Log-scaled so:
+ *   <500 homes sold        → near 0   (very low weight)
+ *   ~5,000 homes sold       → ~0.55   (modest weight)
+ *   ~30,000 homes sold      → ~0.90   (near full weight)
+ *   60,000+ homes sold      → 1.00    (full weight)
+ */
+export function volumeWeight(homesSold: number): number {
+  if (homesSold <= 500) return 0;
+  const LOW = 500;
+  const HIGH = 60000;
+  const numerator = Math.log10(homesSold / LOW);
+  const denominator = Math.log10(HIGH / LOW);
+  const w = numerator / denominator;
+  return Math.max(0, Math.min(1, w));
+}
+
+/**
  * Score variant used by the Marketing Spend Insights states table:
- * Pending % and DOM only — Homes Sold is shown as a column but not scored.
+ * Blends Pending % + DOM, then multiplies by a volume weight so small states
+ * with high percentages but low volume are de-prioritized in rankings.
  */
 export function scoreRowStatesOnly(row: MarketRow): ScoredRow {
   const base = scoreRow(row);
-  const marketing_score = (base.pending_score + base.dom_score) / 2;
+  const raw = (base.pending_score + base.dom_score) / 2;
+  const weight = volumeWeight(row.homes_sold);
+  const marketing_score = raw * weight;
   return { ...base, marketing_score };
 }
 
