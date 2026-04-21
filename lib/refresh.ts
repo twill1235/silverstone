@@ -1,12 +1,12 @@
 // lib/refresh.ts
 // Pulls Redfin Data Center TSVs (state/county/zip), streams them (avoids V8's
-// 512MB string cap on the ~1GB ZIP file), picks the MOST RECENT row per geo,
-// and emits Redfin's pre-computed values directly. Time-window keys exist for
-// UI compatibility but all carry the same underlying Redfin snapshot.
+// 512MB string cap on the ~1GB ZIP file), and for each geo keeps the THREE
+// most-recent monthly snapshots (spaced ≥25 days apart). All output fields are
+// AVERAGED across those three snapshots to produce stable 90-day trends.
 //
-// "Pending %" in the UI = Redfin's `off_market_in_two_weeks` column: the
-// percentage of homes that went under contract within two weeks of listing.
-// Real 0-100% market-heat metric — high = hot market.
+// "Pending %" in the UI = 90-day average of Redfin's `off_market_in_two_weeks`
+// column across the 3 monthly snapshots. A real 0-100% market-heat metric that
+// smooths week-to-week noise.
 
 import zlib from "node:zlib";
 import { Readable } from "node:stream";
@@ -55,16 +55,26 @@ function cleanRegionName(name: string, geoType: "state" | "county" | "zip") {
   return name.trim();
 }
 
-interface Snap {
-  name: string;
-  stateCode: string;
+interface Sample {
   asOf: string;
   asOfMs: number;
   homesSold: number;
-  offMarketInTwoWeeksPct: number | null; // 0-100
+  offMarketInTwoWeeksPct: number | null;
+  soldAboveListPct: number | null;
   medianDom: number | null;
   medianSalePrice: number | null;
 }
+
+interface Snap {
+  name: string;
+  stateCode: string;
+  /** Up to 3 most-recent samples, spaced ≥25 days apart, newest first. */
+  samples: Sample[];
+}
+
+/** Target spacing between retained samples (days). */
+const SAMPLE_MIN_SPACING_DAYS = 25;
+const SAMPLES_PER_GEO = 3;
 
 async function streamAndAggregate(
   url: string,
@@ -120,31 +130,72 @@ async function streamAndAggregate(
     if (!Number.isFinite(periodEndMs)) continue;
 
     const key = geoType === "zip" ? region : `${region}|${stateCode}`;
-    const existing = byGeo.get(key);
-    if (existing && periodEndMs <= existing.asOfMs) continue;
 
     const homesSoldNum = toNum(getCol("homes_sold")) ?? 0;
     const offMarketRaw = toNum(getCol("off_market_in_two_weeks"));
+    const soldAboveRaw = toNum(getCol("sold_above_list"));
     const medianDomNum = toNum(getCol("median_dom"));
     const medianSalePriceNum = toNum(getCol("median_sale_price"));
 
-    // Redfin publishes off_market_in_two_weeks as a 0-1 fraction. Normalize to 0-100.
-    // Defensive: if a row is already >1, assume it's already percent-scaled.
-    let offMarketPct: number | null = null;
-    if (offMarketRaw != null) {
-      offMarketPct = offMarketRaw <= 1 ? offMarketRaw * 100 : offMarketRaw;
-    }
+    const normalizePct = (v: number | null): number | null => {
+      if (v == null) return null;
+      // Redfin publishes these as 0-1 fractions; defensively handle already-scaled values.
+      return v <= 1 ? v * 100 : v;
+    };
 
-    byGeo.set(key, {
-      name: region,
-      stateCode,
+    const sample: Sample = {
       asOf: periodEnd,
       asOfMs: periodEndMs,
       homesSold: Math.round(homesSoldNum),
-      offMarketInTwoWeeksPct: offMarketPct,
+      offMarketInTwoWeeksPct: normalizePct(offMarketRaw),
+      soldAboveListPct: normalizePct(soldAboveRaw),
       medianDom: medianDomNum,
       medianSalePrice: medianSalePriceNum
-    });
+    };
+
+    let state = byGeo.get(key);
+    if (!state) {
+      state = { name: region, stateCode, samples: [sample] };
+      byGeo.set(key, state);
+      kept++;
+      continue;
+    }
+
+    // Keep latest name/stateCode spelling if this row is newer than anything we have.
+    if (state.samples.length === 0 || periodEndMs > state.samples[0].asOfMs) {
+      state.name = region;
+      state.stateCode = stateCode;
+    }
+
+    // Insert into samples (keep newest-first, only keep SAMPLES_PER_GEO total,
+    // require ≥ SAMPLE_MIN_SPACING_DAYS between retained samples).
+    const minSpacingMs = SAMPLE_MIN_SPACING_DAYS * 86_400_000;
+
+    // Skip if this row is too close to any already-retained sample.
+    let tooClose = false;
+    for (const s of state.samples) {
+      if (Math.abs(periodEndMs - s.asOfMs) < minSpacingMs) {
+        // Within spacing window — only replace if this one is strictly newer.
+        if (periodEndMs > s.asOfMs) {
+          // Replace the too-close sample with the newer one.
+          const idx = state.samples.indexOf(s);
+          state.samples[idx] = sample;
+        }
+        tooClose = true;
+        break;
+      }
+    }
+    if (tooClose) {
+      state.samples.sort((a, b) => b.asOfMs - a.asOfMs);
+      continue;
+    }
+
+    // Not too close — add, sort, trim.
+    state.samples.push(sample);
+    state.samples.sort((a, b) => b.asOfMs - a.asOfMs);
+    if (state.samples.length > SAMPLES_PER_GEO) {
+      state.samples.length = SAMPLES_PER_GEO;
+    }
     kept++;
   }
 
@@ -152,11 +203,41 @@ async function streamAndAggregate(
 
   const out: MarketRow[] = [];
   for (const [key, s] of byGeo) {
-    const pending_pct = s.offMarketInTwoWeeksPct ?? 0;
-    const median_dom = s.medianDom ?? 0;
-    const dom_sub60_share =
-      s.medianDom != null ? (s.medianDom < 60 ? 1 : 0) : 0;
+    if (s.samples.length === 0) continue;
 
+    // Helper: average a field across samples, skipping nulls.
+    const avg = (pick: (x: Sample) => number | null): number | null => {
+      let sum = 0;
+      let n = 0;
+      for (const sample of s.samples) {
+        const v = pick(sample);
+        if (v != null) { sum += v; n++; }
+      }
+      return n > 0 ? sum / n : null;
+    };
+
+    const pendingAvg = avg((x) => x.offMarketInTwoWeeksPct);
+    const soldAboveAvg = avg((x) => x.soldAboveListPct);
+    const domAvg = avg((x) => x.medianDom);
+    const priceAvg = avg((x) => x.medianSalePrice);
+    // homes_sold summed across samples is a meaningful 90-day volume figure.
+    let homesSoldTotal = 0;
+    for (const sample of s.samples) homesSoldTotal += sample.homesSold;
+
+    const pending_pct = pendingAvg ?? 0;
+    const median_dom = domAvg ?? 0;
+    const dom_sub60_share = domAvg != null ? (domAvg < 60 ? 1 : 0) : 0;
+
+    // Composite Heat Score (0-100): pending + sold-above-list + DOM (inverted).
+    // DOM normalized so 0 days = 100 points, 120+ days = 0 points.
+    const domScore = domAvg == null ? 0 : Math.max(0, Math.min(100, 100 - (domAvg / 120) * 100));
+    const parts: number[] = [];
+    if (pendingAvg != null) parts.push(pendingAvg);
+    if (soldAboveAvg != null) parts.push(soldAboveAvg);
+    if (domAvg != null) parts.push(domScore);
+    const heatScore = parts.length > 0 ? parts.reduce((a, b) => a + b, 0) / parts.length : 0;
+
+    const newestAsOf = s.samples[0].asOf;
     const geoId = geoType === "zip" ? s.name.replace(/[^\d]/g, "") : key;
     const cleanedName = cleanRegionName(s.name, geoType);
 
@@ -167,13 +248,13 @@ async function streamAndAggregate(
         name: cleanedName,
         state: s.stateCode,
         population: null,
-        median_sale_price: s.medianSalePrice,
+        median_sale_price: priceAvg,
         pending_pct: round(pending_pct, 2),
         median_dom: round(median_dom, 1),
         dom_sub60_share,
-        homes_sold: s.homesSold,
+        homes_sold: homesSoldTotal,
         window: winKey,
-        as_of: s.asOf
+        as_of: newestAsOf
       });
     }
   }
@@ -280,7 +361,7 @@ function buildStateNameMap(): Map<string, string> {
 }
 
 export async function buildDataset(): Promise<Dataset> {
-  console.log("[refresh] buildDataset v=offmarket-2wk");
+  console.log("[refresh] buildDataset v=90d-3snapshot-avg");
   const all: MarketRow[] = [];
   for (const geo of ["state", "county", "zip"] as const) {
     const rows = await streamAndAggregate(SOURCES[geo], geo);
