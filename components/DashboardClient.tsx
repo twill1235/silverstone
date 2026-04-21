@@ -5,7 +5,14 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ScoredRow, TimeWindow } from "@/lib/scoring";
 import { WINDOW_LABELS } from "@/lib/scoring";
 
-type Meta = { generated_at: string; source: string; row_count: number };
+type Meta = {
+  generated_at: string;
+  source: string;
+  row_count: number;
+  state_as_of: string | null;
+  county_as_of: string | null;
+  zip_as_of: string | null;
+};
 
 export default function DashboardClient({ meta }: { meta: Meta }) {
   const [win, setWin] = useState<TimeWindow>("90d");
@@ -141,7 +148,13 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
         <div className="mast-meta">
           <div>VOL. 1 · ISSUE {isoWeek()}</div>
           <div>Live blend · Redfin + US Census</div>
-          <div><strong>Dataset</strong> · {generatedLabel}</div>
+          {meta.state_as_of && (
+            <div><strong>State / County</strong> · 30-day rolling through {meta.state_as_of}</div>
+          )}
+          {meta.zip_as_of && (
+            <div><strong>ZIP</strong> · 90-day rolling through {meta.zip_as_of}</div>
+          )}
+          <div><strong>Last refresh</strong> · {generatedLabel}</div>
           <div><strong>Rows</strong> · {meta.row_count.toLocaleString()}</div>
         </div>
       </header>
@@ -192,42 +205,14 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
         )}
       </section>
 
-      {/* TIME WINDOW */}
-      <section className="section">
-        <div className="section-head">
-          <span className="section-num">§ 02</span>
-          <h2 className="section-title">Time window</h2>
-          <span className="section-note">Applies to all search results, rankings, and the state marketing table. Redfin publishes at 30-day (state/county) and 90-day (ZIP) rolling windows — longer windows are unavailable.</span>
-        </div>
-        <div className="window-bar" role="radiogroup" aria-label="Time window">
-          {(Object.keys(WINDOW_LABELS) as TimeWindow[]).map((k) => {
-            const disabled = k === "180d" || k === "1y";
-            return (
-              <button
-                key={k}
-                className={`${win === k ? "active" : ""}${disabled ? " disabled" : ""}`}
-                onClick={() => { if (!disabled) setWin(k); }}
-                aria-checked={win === k}
-                aria-disabled={disabled}
-                role="radio"
-                disabled={disabled}
-                title={disabled ? "Not published by Redfin" : undefined}
-              >
-                {WINDOW_LABELS[k]}
-              </button>
-            );
-          })}
-        </div>
-      </section>
+      {/* (time-window section removed — Redfin only publishes at fixed rolling periods) */}
 
       {/* TOP 15 BY STATE — ranked by Pending % desc */}
       <section className="section">
         <div className="section-head">
-          <span className="section-num">§ 03</span>
+          <span className="section-num">§ 02</span>
           <h2 className="section-title">Top 15 hottest counties by state</h2>
-          <span className="section-note">
-            {WINDOW_LABELS[win]} · Ranked by Pending %
-          </span>
+          <span className="section-note">Ranked by Pending %</span>
         </div>
         <div className="state-picker">
           <label htmlFor="top-state">State:</label>
@@ -251,9 +236,9 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
       {/* MARKETING SPEND — all 50 states */}
       <section className="section">
         <div className="section-head">
-          <span className="section-num">§ 04</span>
+          <span className="section-num">§ 03</span>
           <h2 className="section-title">Marketing spend insights — all states</h2>
-          <span className="section-note">Equal-weighted score · Pending % + DOM sub-60 share · {WINDOW_LABELS[win].toLowerCase()}</span>
+          <span className="section-note">Equal-weighted score · Pending % + DOM sub-60 share</span>
         </div>
         <div className="legend">
           <span><strong>Pending %:</strong> share of sold inventory currently under contract</span>
