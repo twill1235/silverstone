@@ -241,7 +241,7 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
           <span className="section-note">Equal-weighted score · Pending % + DOM sub-60 share</span>
         </div>
         <div className="legend">
-          <span><strong>Pending %:</strong> share of sold inventory currently under contract</span>
+          <span><strong>Pending %:</strong> homes pending or accepting backup offers ÷ homes currently for sale</span>
           <span><strong>Avg DOM:</strong> median days on market, weekly blend</span>
           <span><strong>Homes Sold:</strong> shown for context · not scored</span>
         </div>
