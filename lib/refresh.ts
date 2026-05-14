@@ -37,10 +37,10 @@ export const SOURCES: Record<"state" | "county" | "zip", string> = {
 
 const WINDOW_KEYS: TimeWindow[] = ["30d", "90d", "180d", "1y"];
 
-// Once we've seen this many distinct PERIOD BEGIN values, every geo has at
-// minimum its 3 most-recent snapshots covered. (Spaced >=25 days apart, so
-// 6 distinct monthly periods is plenty for 3 retained samples per geo.)
-const DISTINCT_PERIODS_TO_COVER = 6;
+// Streaming readline lets us process the 447 MB zip file without buffering
+// it into a single string (V8's ~512 MB max-string-length would error). The
+// file is sorted by (REGION, PERIOD BEGIN DESC), so we let the snapshot
+// dedupe + spacing logic naturally cap each geo at 3 samples.
 
 const STATE_NAME_TO_CODE: Map<string, string> = buildStateNameToCode();
 
@@ -212,8 +212,6 @@ async function streamAndAggregate(
   let headerIdx: Record<string, number> | null = null;
   let lineNum = 0;
   let kept = 0;
-  const seenPeriodBegins = new Set<string>();
-  let bailout = false;
 
   for await (const line of rl) {
     lineNum++;
@@ -241,8 +239,6 @@ async function streamAndAggregate(
       continue;
     }
 
-    if (bailout) break;
-
     const cells = parseCsvLine(line);
     const getCol = (k: string): string | undefined => {
       const idx = headerIdx![k];
@@ -252,7 +248,6 @@ async function streamAndAggregate(
 
     const periodEnd = stripQuotes(getCol("period_end"));
     if (!periodEnd) continue;
-    const periodBegin = stripQuotes(getCol("period_begin"));
     const periodEndMs = Date.parse(periodEnd);
     if (!Number.isFinite(periodEndMs)) continue;
 
@@ -317,20 +312,12 @@ async function streamAndAggregate(
       }
     }
 
-    if (periodBegin && !seenPeriodBegins.has(periodBegin)) {
-      seenPeriodBegins.add(periodBegin);
-      if (seenPeriodBegins.size > DISTINCT_PERIODS_TO_COVER) {
-        bailout = true;
-      }
-    }
   }
 
   try { rl.close(); } catch {}
 
   console.log(
-    `[refresh ${geoType}] lines=${lineNum} kept=${kept} geos=${byGeo.size} ` +
-      `distinct_periods_seen=${seenPeriodBegins.size}` +
-      (bailout ? " (early-exit)" : "")
+    `[refresh ${geoType}] lines=${lineNum} kept=${kept} geos=${byGeo.size}`
   );
 
   return materializeRows(byGeo, geoType);
