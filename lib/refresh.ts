@@ -467,7 +467,9 @@ export async function buildDataset(): Promise<BuildResult> {
   const all: MarketRow[] = [];
   for (const geo of ["state", "county", "zip"] as const) {
     const rows = await streamAndAggregate(SOURCES[geo], geo);
-    all.push(...rows);
+    // Avoid `all.push(...rows)` — spread of large arrays exceeds V8's
+    // max-arguments limit (~65K) and throws "Maximum call stack size exceeded".
+    for (let i = 0; i < rows.length; i++) all.push(rows[i]);
   }
   await enrichWithCensus(all);
 
