@@ -176,10 +176,10 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
           <div>VOL. 1 · ISSUE {isoWeek()}</div>
           <div>Live blend · Redfin + US Census</div>
           {meta.state_as_of && (
-            <div><strong>State / County</strong> · 30-day rolling through {meta.state_as_of}</div>
+            <div><strong>State / County</strong> · monthly through {meta.state_as_of}</div>
           )}
           {meta.zip_as_of && (
-            <div><strong>ZIP</strong> · 90-day rolling through {meta.zip_as_of}</div>
+            <div><strong>ZIP</strong> · 3-month rolling through {meta.zip_as_of}</div>
           )}
           <div><strong>Last refresh</strong> · {generatedLabel}</div>
           <div><strong>Rows</strong> · {meta.row_count.toLocaleString()}</div>
@@ -241,7 +241,7 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
           />
           <SearchCard
             title="ZIP Code"
-            hint="Enter any 5-digit ZIP code currently covered by Redfin."
+            hint="Enter any 5-digit ZIP code. ZIP data is reported on a 3-month rolling window."
             value={zipQ}
             onChange={setZipQ}
             onSubmit={() => runZipSearch(zipQ)}
@@ -352,13 +352,21 @@ function SingleResult({
   if (loading) return <div className="result"><span className="dots">Searching</span></div>;
   if (error) return <div className="result"><em style={{ color: "var(--bad)" }}>{error}</em></div>;
   if (!row) return null;
+  const isZip = row.geo_type === "zip";
   return (
     <div className="result">
       <div className="result-head">
         <div className="result-name">
           {row.name}{row.geo_type === "county" ? `, ${row.state}` : row.geo_type === "zip" ? ` · ${row.state}` : ""}
         </div>
-        <div className="result-kind">{label} · As of {row.as_of}</div>
+        <div className="result-kind">
+          {label} · As of {row.as_of}
+          {isZip && (
+            <span style={{ color: "var(--ink-3)", marginLeft: 8 }}>
+              · 3-month rolling window
+            </span>
+          )}
+        </div>
       </div>
       <FullMetricGrid row={row} />
     </div>
