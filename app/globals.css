@@ -105,6 +105,42 @@ body {
   .mast-meta { text-align: left; }
 }
 
+/* FRESHNESS BANNER */
+.freshness-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  margin: 20px 0 0;
+  padding: 14px 18px;
+  border: 1px solid var(--line-soft);
+  border-left-width: 4px;
+  background: var(--bg-elev);
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--ink-2);
+}
+.freshness-banner.warn { border-left-color: var(--warn); }
+.freshness-banner.bad  { border-left-color: var(--bad); background: rgba(163, 51, 30, 0.06); }
+.freshness-banner .fb-icon {
+  font-family: "JetBrains Mono", monospace;
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  padding: 3px 8px;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+.freshness-banner.warn .fb-icon { background: var(--warn); color: #1a1916; }
+.freshness-banner.bad  .fb-icon { background: var(--bad);  color: #f3efe7; }
+.freshness-banner .fb-body strong { color: var(--ink); font-weight: 600; }
+.freshness-banner .fb-body .fb-detail {
+  display: block;
+  margin-top: 4px;
+  color: var(--ink-3);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+}
+
 /* SECTION HEADINGS */
 .section {
   margin: 40px 0;
