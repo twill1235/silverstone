@@ -1,47 +1,49 @@
 // lib/refresh.ts
-// Pulls Redfin Data Center TSVs (state/county/zip), streams them (avoids V8's
-// 512MB string cap on the ~1GB ZIP file), and for each geo keeps the THREE
-// most-recent monthly snapshots (spaced ≥25 days apart). All output fields are
-// AVERAGED across those three snapshots to produce stable 90-day trends.
+// Pulls Redfin's new Data Center monthly CSVs (state/county/zip).
 //
-// "Pending %" = 90-day average of (pending_sales ÷ inventory × 100), computed
-// per monthly snapshot then averaged across the 3 snapshots. Filtered to
-// property_type = "All Residential" so numbers match totals on redfin.com.
+// Format notes (post May 2026 Data Center relaunch):
+//   - Plain comma-separated, every header and text cell double-quoted.
+//   - Served uncompressed. We use HTTP Range requests to grab only the
+//     newest slice (file is sorted DESCENDING by PERIOD BEGIN), which
+//     avoids pulling the full 446 MB ZIP file.
+//   - State/county are calendar-monthly. ZIP is rolling 3-month — that's
+//     the only ZIP granularity Redfin publishes now.
+//   - Property type breakdown is gone; everything is "all residential".
+//
+// We emit one row per (geo, window) keeping the existing 30d/90d/180d/1y
+// window keys so the dashboard UI keeps working — but every window
+// carries the same monthly snapshot since per-window aggregation no
+// longer exists at the source.
 
-import zlib from "node:zlib";
-import { Readable } from "node:stream";
-import readline from "node:readline";
-import type { ReadableStream as NodeWebReadableStream } from "node:stream/web";
 import type { MarketRow, TimeWindow } from "./scoring";
 import type { Dataset } from "./data";
 
-const SOURCES: Record<"state" | "county" | "zip", string> = {
-  state:
-    "https://redfin-public-data.s3.us-west-2.amazonaws.com/redfin_market_tracker/state_market_tracker.tsv000.gz",
-  county:
-    "https://redfin-public-data.s3.us-west-2.amazonaws.com/redfin_market_tracker/county_market_tracker.tsv000.gz",
-  zip:
-    "https://redfin-public-data.s3.us-west-2.amazonaws.com/redfin_market_tracker/zip_code_market_tracker.tsv000.gz"
+const BASE = "https://redfin-public-data.s3.us-west-2.amazonaws.com/redfin_data_center";
+
+const SOURCES: Record<"state" | "county" | "zip", { url: string; rangeBytes: number }> = {
+  // file ~1.7 MB total — grab the whole thing
+  state:  { url: `${BASE}/housing_market/monthly/all_states.csv`,   rangeBytes: 2_000_000 },
+  // file ~100 MB — first 4 MB covers many months of all counties
+  county: { url: `${BASE}/housing_market/monthly/all_counties.csv`, rangeBytes: 4_000_000 },
+  // file ~446 MB — first 12 MB covers the newest rolling-3-month slice for all zips
+  zip:    { url: `${BASE}/housing_market/monthly/all_zips.csv`,     rangeBytes: 12_000_000 }
 };
+
+const MANIFEST_URL = `${BASE}/index.json`;
 
 const WINDOW_KEYS: TimeWindow[] = ["30d", "90d", "180d", "1y"];
 
-/** period_duration Redfin uses per file; verified from production logs. */
-const PERIOD_DURATION_BY_GEO: Record<"state" | "county" | "zip", number> = {
-  state: 30,
-  county: 30,
-  zip: 90
-};
-
-function stripQuotes(v: string | undefined): string | undefined {
-  if (v == null) return undefined;
-  return v.replace(/^"|"$/g, "");
+function toNum(v: string | undefined): number | null {
+  if (v == null) return null;
+  const stripped = v.replace(/^"|"$/g, "").trim();
+  if (stripped === "" || stripped === "NA" || stripped.toUpperCase() === "N/A") return null;
+  const n = Number(stripped.replace(/,/g, ""));
+  return Number.isFinite(n) ? n : null;
 }
 
-function toNum(v: string | undefined): number | null {
-  if (v == null || v === "" || v === "NA") return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
+function stripQuotes(v: string | undefined): string {
+  if (v == null) return "";
+  return v.replace(/^"|"$/g, "").trim();
 }
 
 function round(n: number, d: number): number {
@@ -49,238 +51,232 @@ function round(n: number, d: number): number {
   return Math.round(n * m) / m;
 }
 
-function cleanRegionName(name: string, geoType: "state" | "county" | "zip") {
-  if (!name) return "";
-  if (geoType === "zip") return name.replace(/^Zip Code:\s*/i, "").trim();
-  return name.trim();
+function normalizeHeader(h: string): string {
+  return stripQuotes(h).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
 }
 
-interface Sample {
-  asOf: string;
-  asOfMs: number;
-  homesSold: number;
-  pendingSales: number | null;
-  activeListings: number | null;
-  soldAboveListPct: number | null;
-  medianDom: number | null;
-  medianSalePrice: number | null;
+/**
+ * Parse a CSV line that may contain quoted fields with embedded commas.
+ * Redfin's new files quote every text cell, so the parser must respect quotes.
+ */
+function parseCsvLine(line: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        // Escaped quote (RFC 4180): "" inside quoted field → literal "
+        if (line[i + 1] === '"') {
+          cur += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        cur += ch;
+      }
+    } else {
+      if (ch === ",") {
+        out.push(cur);
+        cur = "";
+      } else if (ch === '"') {
+        inQuotes = true;
+      } else {
+        cur += ch;
+      }
+    }
+  }
+  out.push(cur);
+  return out;
 }
 
-interface Snap {
+/**
+ * Counties (and ZIPs) embed the state inside REGION NAME as
+ * "Bergen County, NJ" or similar. Pull it out.
+ */
+function parseRegionState(
+  region: string,
+  geoType: "state" | "county" | "zip"
+): { name: string; stateCode: string } {
+  if (geoType === "state") {
+    return { name: region, stateCode: "" };
+  }
+  // ZIP names commonly come as "Zip Code: 07030, NJ" or just "07030, NJ" — try both.
+  const cleaned = region.replace(/^Zip Code:\s*/i, "").trim();
+  const m = cleaned.match(/^(.*?),\s*([A-Z]{2})\s*$/);
+  if (m) {
+    return { name: m[1].trim(), stateCode: m[2] };
+  }
+  return { name: cleaned, stateCode: "" };
+}
+
+interface ParsedRow {
+  geoType: "state" | "county" | "zip";
   name: string;
   stateCode: string;
-  /** Up to 3 most-recent samples, spaced ≥25 days apart, newest first. */
-  samples: Sample[];
+  asOf: string;
+  homesSold: number | null;
+  pendingSales: number | null;
+  activeListings: number | null;
+  medianDom: number | null;
+  medianSalePrice: number | null;
+  sharedAboveListPct: number | null;
 }
 
-/** Target spacing between retained samples (days). */
-const SAMPLE_MIN_SPACING_DAYS = 25;
-const SAMPLES_PER_GEO = 3;
-
-async function streamAndAggregate(
-  url: string,
+async function fetchAndParseSlice(
   geoType: "state" | "county" | "zip"
-): Promise<MarketRow[]> {
+): Promise<ParsedRow[]> {
+  const { url, rangeBytes } = SOURCES[geoType];
+  console.log(`[refresh ${geoType}] fetching first ${rangeBytes} bytes of ${url}`);
+
   const res = await fetch(url, {
-    headers: { "User-Agent": "silverstone-dashboard/1.0" }
+    headers: {
+      "User-Agent": "silverstone-dashboard/2.0",
+      Range: `bytes=0-${rangeBytes - 1}`
+    }
   });
-  if (!res.ok || !res.body) throw new Error(`${url} → ${res.status}`);
+  // S3 returns 206 Partial Content for ranged requests; 200 if it gave us the whole file.
+  if (!res.ok && res.status !== 206) {
+    throw new Error(`${url} → ${res.status}`);
+  }
+  const text = await res.text();
 
-  const webStream = res.body as unknown as NodeWebReadableStream<Uint8Array>;
-  const nodeStream = Readable.fromWeb(webStream);
-  const gunzipStream = nodeStream.pipe(zlib.createGunzip());
-  const rl = readline.createInterface({ input: gunzipStream, crlfDelay: Infinity });
+  const lines = text.split(/\r?\n/);
+  if (lines.length < 2) {
+    throw new Error(`${geoType}: too few lines in response`);
+  }
+  // Drop trailing empty lines, then drop the last (possibly truncated) line.
+  while (lines.length > 0 && lines[lines.length - 1].trim() === "") lines.pop();
+  if (lines.length > 1) lines.pop();
 
-  const byGeo = new Map<string, Snap>();
-  let headerIdx: Record<string, number> | null = null;
-  let lineNum = 0;
-  let kept = 0;
+  const headerCells = parseCsvLine(lines[0]).map(normalizeHeader);
+  const idx: Record<string, number> = {};
+  for (let i = 0; i < headerCells.length; i++) idx[headerCells[i]] = i;
+  console.log(
+    `[refresh ${geoType}] header: ${headerCells.length} cols, sample: ${headerCells.slice(0, 6).join(",")}`
+  );
 
-  for await (const line of rl) {
-    lineNum++;
-    if (!line) continue;
-
-    if (headerIdx == null) {
-      const cols = line.split("\t");
-      headerIdx = {};
-      for (let i = 0; i < cols.length; i++) {
-        const key = (cols[i] ?? "").replace(/^"|"$/g, "").toLowerCase();
-        headerIdx[key] = i;
-      }
-      console.log(`[refresh ${geoType}] header parsed: ${cols.length} cols`);
-      continue;
+  const col = (...candidates: string[]): number | null => {
+    for (const c of candidates) {
+      if (idx[c] != null) return idx[c];
     }
+    return null;
+  };
+  const iPeriodEnd = col("period_end");
+  const iRegion = col("region_name", "region");
+  const iHomesSold = col("homes_sold");
+  const iPending = col("pending_sales");
+  const iActive = col("active_listings", "inventory");
+  const iDom = col("median_days_on_market_days", "median_days_on_market", "median_dom");
+  const iPrice = col("median_sale_price", "median_sale_price_");
+  const iAboveList = col(
+    "share_sold_above_original_list",
+    "share_sold_above_original_list_",
+    "sold_above_list"
+  );
 
-    const cells = line.split("\t");
-    const getCol = (name: string): string | undefined => {
-      const idx = headerIdx![name];
-      if (idx == null) return undefined;
-      return stripQuotes(cells[idx]);
-    };
-
-    const dur = toNum(getCol("period_duration"));
-    if (dur !== PERIOD_DURATION_BY_GEO[geoType]) continue;
-
-    // Redfin publishes 5 property-type breakouts per (geo, period). We only
-    // want the aggregate — "All Residential" — so the numbers match the
-    // totals you'd see on redfin.com.
-    const propertyType = getCol("property_type");
-    if (propertyType !== "All Residential") continue;
-
-    const region = getCol("region") ?? "";
-    if (!region) continue;
-
-    const stateCode = getCol("state_code") || getCol("state") || "";
-    const periodEnd = getCol("period_end") ?? "";
-    if (!periodEnd) continue;
-    const periodEndMs = Date.parse(periodEnd);
-    if (!Number.isFinite(periodEndMs)) continue;
-
-    const key = geoType === "zip" ? region : `${region}|${stateCode}`;
-
-    const homesSoldNum = toNum(getCol("homes_sold")) ?? 0;
-    const pendingSalesNum = toNum(getCol("pending_sales"));
-    const inventoryNum = toNum(getCol("inventory"));
-    const soldAboveRaw = toNum(getCol("sold_above_list"));
-    const medianDomNum = toNum(getCol("median_dom"));
-    const medianSalePriceNum = toNum(getCol("median_sale_price"));
-
-    const normalizePct = (v: number | null): number | null => {
-      if (v == null) return null;
-      return v <= 1 ? v * 100 : v;
-    };
-
-    const sample: Sample = {
-      asOf: periodEnd,
-      asOfMs: periodEndMs,
-      homesSold: Math.round(homesSoldNum),
-      pendingSales: pendingSalesNum,
-      activeListings: inventoryNum, // Redfin's INVENTORY column
-      soldAboveListPct: normalizePct(soldAboveRaw),
-      medianDom: medianDomNum,
-      medianSalePrice: medianSalePriceNum
-    };
-
-    let state = byGeo.get(key);
-    if (!state) {
-      state = { name: region, stateCode, samples: [sample] };
-      byGeo.set(key, state);
-      kept++;
-      continue;
-    }
-
-    // Keep latest name/stateCode spelling if this row is newer than anything we have.
-    if (state.samples.length === 0 || periodEndMs > state.samples[0].asOfMs) {
-      state.name = region;
-      state.stateCode = stateCode;
-    }
-
-    // Insert into samples (keep newest-first, only keep SAMPLES_PER_GEO total,
-    // require ≥ SAMPLE_MIN_SPACING_DAYS between retained samples).
-    const minSpacingMs = SAMPLE_MIN_SPACING_DAYS * 86_400_000;
-
-    // Skip if this row is too close to any already-retained sample.
-    let tooClose = false;
-    for (const s of state.samples) {
-      if (Math.abs(periodEndMs - s.asOfMs) < minSpacingMs) {
-        // Within spacing window — only replace if this one is strictly newer.
-        if (periodEndMs > s.asOfMs) {
-          // Replace the too-close sample with the newer one.
-          const idx = state.samples.indexOf(s);
-          state.samples[idx] = sample;
-        }
-        tooClose = true;
-        break;
-      }
-    }
-    if (tooClose) {
-      state.samples.sort((a, b) => b.asOfMs - a.asOfMs);
-      continue;
-    }
-
-    // Not too close — add, sort, trim.
-    state.samples.push(sample);
-    state.samples.sort((a, b) => b.asOfMs - a.asOfMs);
-    if (state.samples.length > SAMPLES_PER_GEO) {
-      state.samples.length = SAMPLES_PER_GEO;
-    }
-    kept++;
+  if (iPeriodEnd == null || iRegion == null) {
+    throw new Error(
+      `${geoType}: missing required columns. Got headers: ${headerCells.join(",")}`
+    );
   }
 
-  console.log(`[refresh ${geoType}] lines=${lineNum} kept=${kept} geos=${byGeo.size}`);
+  const out: ParsedRow[] = [];
+  let kept = 0;
+  let skipped = 0;
+  for (let li = 1; li < lines.length; li++) {
+    const line = lines[li];
+    if (!line) continue;
+    const cells = parseCsvLine(line);
+    if (cells.length < headerCells.length / 2) {
+      skipped++;
+      continue;
+    }
 
-  const out: MarketRow[] = [];
-  for (const [key, s] of byGeo) {
-    if (s.samples.length === 0) continue;
+    const periodEnd = stripQuotes(cells[iPeriodEnd]);
+    const region = stripQuotes(cells[iRegion]);
+    if (!periodEnd || !region) {
+      skipped++;
+      continue;
+    }
 
-    // Helper: average a field across samples, skipping nulls.
-    const avg = (pick: (x: Sample) => number | null): number | null => {
-      let sum = 0;
-      let n = 0;
-      for (const sample of s.samples) {
-        const v = pick(sample);
-        if (v != null) { sum += v; n++; }
-      }
-      return n > 0 ? sum / n : null;
-    };
+    const { name, stateCode } = parseRegionState(region, geoType);
 
-    // Pending % per snapshot = pending_sales / inventory * 100.
-    // For ZIP, Redfin publishes 90-day rolling data (vs 30-day for state/county).
-    // Dividing ZIP's pending_sales by 3 gives a monthly-equivalent pending count,
-    // so ZIP pending % is comparable to state/county.
-    const pendingDivisor = geoType === "zip" ? 3 : 1;
-    const pendingAvg = avg((x) => {
-      if (x.pendingSales == null || x.activeListings == null || x.activeListings <= 0) {
-        return null;
-      }
-      return ((x.pendingSales / pendingDivisor) / x.activeListings) * 100;
+    out.push({
+      geoType,
+      name,
+      stateCode,
+      asOf: periodEnd,
+      homesSold: iHomesSold != null ? toNum(cells[iHomesSold]) : null,
+      pendingSales: iPending != null ? toNum(cells[iPending]) : null,
+      activeListings: iActive != null ? toNum(cells[iActive]) : null,
+      medianDom: iDom != null ? toNum(cells[iDom]) : null,
+      medianSalePrice: iPrice != null ? toNum(cells[iPrice]) : null,
+      sharedAboveListPct: iAboveList != null ? toNum(cells[iAboveList]) : null
     });
-    const soldAboveAvg = avg((x) => x.soldAboveListPct);
-    const domAvg = avg((x) => x.medianDom);
-    const priceAvg = avg((x) => x.medianSalePrice);
-    let homesSoldTotal = 0;
-    for (const sample of s.samples) homesSoldTotal += sample.homesSold;
+    kept++;
+  }
+  console.log(`[refresh ${geoType}] lines=${lines.length - 1} kept=${kept} skipped=${skipped}`);
+  return out;
+}
 
-    const pending_pct = pendingAvg ?? 0;
-    const median_dom = domAvg ?? 0;
-    const dom_sub60_share = domAvg != null ? (domAvg < 60 ? 1 : 0) : 0;
+/**
+ * For each geo, keep only the most-recent period. The source file is sorted
+ * descending by PERIOD BEGIN, so the first occurrence of each (name, stateCode)
+ * key is the newest.
+ */
+function pickLatestPerGeo(rows: ParsedRow[]): ParsedRow[] {
+  const seen = new Map<string, ParsedRow>();
+  for (const r of rows) {
+    const key = r.geoType === "zip" ? r.name : `${r.name}|${r.stateCode}`;
+    if (!seen.has(key)) seen.set(key, r);
+  }
+  return Array.from(seen.values());
+}
 
-    // Composite Heat Score (0-100): pending + sold-above-list + DOM (inverted).
-    const domScore = domAvg == null ? 0 : Math.max(0, Math.min(100, 100 - (domAvg / 120) * 100));
-    const parts: number[] = [];
-    if (pendingAvg != null) parts.push(Math.min(100, pendingAvg));
-    if (soldAboveAvg != null) parts.push(soldAboveAvg);
-    if (domAvg != null) parts.push(domScore);
-    const heatScore = parts.length > 0 ? parts.reduce((a, b) => a + b, 0) / parts.length : 0;
+function toMarketRows(latest: ParsedRow[]): MarketRow[] {
+  const out: MarketRow[] = [];
+  for (const r of latest) {
+    // Pending % = pending_sales / active_listings * 100. Same definition as before.
+    let pendingPct = 0;
+    if (
+      r.pendingSales != null &&
+      r.activeListings != null &&
+      r.activeListings > 0
+    ) {
+      pendingPct = (r.pendingSales / r.activeListings) * 100;
+    }
+    const medianDom = r.medianDom ?? 0;
+    const dom_sub60_share = r.medianDom != null && r.medianDom < 60 ? 1 : 0;
+    const geoId = r.geoType === "zip" ? r.name.replace(/[^\d]/g, "") : `${r.name}|${r.stateCode}`;
 
-    const newestAsOf = s.samples[0].asOf;
-    const geoId = geoType === "zip" ? s.name.replace(/[^\d]/g, "") : key;
-    const cleanedName = cleanRegionName(s.name, geoType);
-
+    // Same row replicated across windows. Dashboard UI keeps its window
+    // selector intact, but every window points at the same monthly snapshot
+    // because the new feed no longer publishes per-window aggregations.
     for (const winKey of WINDOW_KEYS) {
       out.push({
-        geo_type: geoType,
+        geo_type: r.geoType,
         geo_id: geoId,
-        name: cleanedName,
-        state: s.stateCode,
+        name: r.name,
+        state: r.stateCode,
         population: null,
-        median_sale_price: priceAvg,
-        pending_pct: round(pending_pct, 2),
-        median_dom: round(median_dom, 1),
+        median_sale_price: r.medianSalePrice,
+        pending_pct: round(pendingPct, 2),
+        median_dom: round(medianDom, 1),
         dom_sub60_share,
-        homes_sold: homesSoldTotal,
+        homes_sold: r.homesSold != null ? Math.round(r.homesSold) : 0,
         window: winKey,
-        as_of: newestAsOf
+        as_of: r.asOf
       });
     }
   }
-
   return out;
 }
 
 async function enrichWithCensus(rows: MarketRow[]): Promise<void> {
   try {
-    // ----- States -----
     const stateRes = await fetch(
       "https://api.census.gov/data/2022/acs/acs5?get=NAME,B01003_001E&for=state:*"
     );
@@ -304,7 +300,6 @@ async function enrichWithCensus(rows: MarketRow[]): Promise<void> {
       console.warn(`[census] state fetch failed: ${stateRes.status}`);
     }
 
-    // ----- Counties -----
     const countyRes = await fetch(
       "https://api.census.gov/data/2022/acs/acs5?get=NAME,B01003_001E&for=county:*"
     );
@@ -376,17 +371,83 @@ function buildStateNameMap(): Map<string, string> {
   return m;
 }
 
+/**
+ * Best-effort manifest check. Returns true if reachable + parseable; otherwise
+ * logs and continues. Manifest content isn't strictly required for the build —
+ * it's mainly a sanity probe so cron logs flag upstream changes early.
+ */
+async function probeManifest(): Promise<void> {
+  try {
+    const res = await fetch(MANIFEST_URL, {
+      headers: { "User-Agent": "silverstone-dashboard/2.0" }
+    });
+    if (!res.ok) {
+      console.warn(`[manifest] ${MANIFEST_URL} → ${res.status}`);
+      return;
+    }
+    const json = (await res.json()) as { date_ranges?: unknown };
+    if (json.date_ranges) {
+      console.log(
+        `[manifest] ok, date_ranges keys: ${Object.keys(json.date_ranges as object).length}`
+      );
+    } else {
+      console.log(`[manifest] ok (no date_ranges block)`);
+    }
+  } catch (e) {
+    console.warn(`[manifest] probe failed: ${(e as Error).message}`);
+  }
+}
+
+/**
+ * Lightweight HEAD probe — returns the newest Last-Modified across the three
+ * monthly CSVs. Used by /api/refresh to decide whether to skip a rebuild.
+ */
+export async function probeLastModified(): Promise<{
+  newestLastModified: string | null;
+  perFile: Record<string, string | null>;
+}> {
+  const perFile: Record<string, string | null> = {};
+  let newestMs = -Infinity;
+  let newestStr: string | null = null;
+  for (const [geo, { url }] of Object.entries(SOURCES)) {
+    try {
+      const res = await fetch(url, {
+        method: "HEAD",
+        headers: { "User-Agent": "silverstone-dashboard/2.0" }
+      });
+      const lm = res.headers.get("last-modified");
+      perFile[geo] = lm;
+      if (lm) {
+        const ms = Date.parse(lm);
+        if (Number.isFinite(ms) && ms > newestMs) {
+          newestMs = ms;
+          newestStr = lm;
+        }
+      }
+    } catch (e) {
+      perFile[geo] = null;
+      console.warn(`[head ${geo}] ${(e as Error).message}`);
+    }
+  }
+  return { newestLastModified: newestStr, perFile };
+}
+
 export async function buildDataset(): Promise<Dataset> {
-  console.log("[refresh] buildDataset v=pending-over-inventory-zip-norm");
+  console.log("[refresh] buildDataset v=data-center-2026-05");
+  await probeManifest();
+
   const all: MarketRow[] = [];
   for (const geo of ["state", "county", "zip"] as const) {
-    const rows = await streamAndAggregate(SOURCES[geo], geo);
-    all.push(...rows);
+    const rows = await fetchAndParseSlice(geo);
+    const latest = pickLatestPerGeo(rows);
+    console.log(`[refresh ${geo}] unique geos in slice: ${latest.length}`);
+    const marketRows = toMarketRows(latest);
+    all.push(...marketRows);
   }
   await enrichWithCensus(all);
   return {
     generated_at: new Date().toISOString(),
-    source: "Redfin Data Center + US Census ACS 5yr",
+    source: "Redfin Data Center (new pipeline, May 2026) + US Census ACS 5yr",
     rows: all
   };
 }
