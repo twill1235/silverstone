@@ -129,6 +129,33 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
     catch { return meta.generated_at; }
   }, [meta.generated_at]);
 
+  const freshness = useMemo(() => {
+    // Find the newest as_of across geos (this is the actual Redfin data cutoff).
+    const candidates = [meta.state_as_of, meta.county_as_of, meta.zip_as_of].filter(
+      (s): s is string => !!s
+    );
+    if (candidates.length === 0) return null;
+    const newestAsOf = candidates.sort().reverse()[0];
+
+    const asOfMs = Date.parse(newestAsOf);
+    const refreshMs = Date.parse(meta.generated_at);
+    if (!Number.isFinite(asOfMs)) return null;
+
+    const now = Date.now();
+    const daysSinceData = Math.floor((now - asOfMs) / 86_400_000);
+    const daysSinceRefresh = Number.isFinite(refreshMs)
+      ? Math.floor((now - refreshMs) / 86_400_000)
+      : null;
+
+    // Redfin pushes weekly. ≤7 days = healthy. 8-14 = noticeable but not necessarily broken.
+    // >14 = something is wrong (either Redfin paused or our pipeline is failing).
+    let level: "ok" | "warn" | "bad" = "ok";
+    if (daysSinceData > 14) level = "bad";
+    else if (daysSinceData > 7) level = "warn";
+
+    return { newestAsOf, daysSinceData, daysSinceRefresh, level };
+  }, [meta.state_as_of, meta.county_as_of, meta.zip_as_of, meta.generated_at]);
+
   return (
     <div className="shell">
       {/* MASTHEAD */}
@@ -158,6 +185,35 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
           <div><strong>Rows</strong> · {meta.row_count.toLocaleString()}</div>
         </div>
       </header>
+
+      {/* FRESHNESS BANNER — only renders when data is >7 days stale */}
+      {freshness && freshness.level !== "ok" && (
+        <div className={`freshness-banner ${freshness.level}`}>
+          <span className="fb-icon">
+            {freshness.level === "bad" ? "STALE" : "NOTICE"}
+          </span>
+          <div className="fb-body">
+            {freshness.level === "bad" ? (
+              <>
+                <strong>Data is {freshness.daysSinceData} days behind.</strong>{" "}
+                Redfin typically publishes weekly. Either the upstream feed has paused or
+                the refresh pipeline is failing — worth investigating.
+              </>
+            ) : (
+              <>
+                <strong>Data through {freshness.newestAsOf}</strong> ({freshness.daysSinceData} days old).
+                Refresh job is running but Redfin hasn&apos;t pushed newer data yet.
+              </>
+            )}
+            <span className="fb-detail">
+              Newest as_of: {freshness.newestAsOf} · Last refresh:{" "}
+              {freshness.daysSinceRefresh != null
+                ? `${freshness.daysSinceRefresh}d ago`
+                : generatedLabel}
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* SEARCH TRIAD */}
       <section className="section">
