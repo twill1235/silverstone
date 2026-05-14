@@ -37,6 +37,7 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
   const [stateList, setStateList] = useState<{ code: string; name: string }[]>([]);
   const [topState, setTopState] = useState<string>("");
   const [topRows, setTopRows] = useState<ScoredRow[]>([]);
+  const [topSort, setTopSort] = useState<"score" | "pending">("score");
 
   // Marketing spend — all 50 states
   const [allStatesRows, setAllStatesRows] = useState<ScoredRow[]>([]);
@@ -69,16 +70,16 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
     })();
   }, [win, fetchJSON]);
 
-  // Top counties reload when state or window changes
+  // Top counties reload when state, window, or sort criterion changes
   useEffect(() => {
     if (!topState) return;
     (async () => {
       const data = await fetchJSON<{ results: ScoredRow[] }>(
-        `/api/search?mode=topByState&q=${encodeURIComponent(topState)}&window=${win}`
+        `/api/search?mode=topByState&q=${encodeURIComponent(topState)}&window=${win}&sortBy=${topSort}`
       );
       setTopRows(data.results);
     })();
-  }, [topState, win, fetchJSON]);
+  }, [topState, win, topSort, fetchJSON]);
 
   // When window changes, re-run active searches
   useEffect(() => {
@@ -263,12 +264,19 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
 
       {/* (time-window section removed — Redfin only publishes at fixed rolling periods) */}
 
-      {/* TOP 15 BY STATE — ranked by Pending % desc */}
+      {/* TOP 15 BY STATE — server-selected by Score (default) or Pending % */}
       <section className="section">
         <div className="section-head">
           <span className="section-num">§ 02</span>
-          <h2 className="section-title">Top 15 hottest counties by state</h2>
-          <span className="section-note">Click any column to sort</span>
+          <h2 className="section-title">
+            Top 15 {topSort === "score" ? "best" : "hottest"} counties by state
+          </h2>
+          <span className="section-note">
+            {topSort === "score"
+              ? "Ranked by Score (Pending % + DOM + volume)"
+              : "Ranked by Pending %"}
+            {" · click any column to re-sort"}
+          </span>
         </div>
         <div className="state-picker">
           <label htmlFor="top-state">State:</label>
@@ -281,9 +289,29 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
               <option key={s.code} value={s.code}>{s.name} ({s.code})</option>
             ))}
           </select>
+          <div className="top-sort-toggle" role="tablist" aria-label="Sort criterion">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={topSort === "score"}
+              className={topSort === "score" ? "active" : ""}
+              onClick={() => setTopSort("score")}
+            >
+              Score
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={topSort === "pending"}
+              className={topSort === "pending" ? "active" : ""}
+              onClick={() => setTopSort("pending")}
+            >
+              Pending %
+            </button>
+          </div>
         </div>
         {topRows.length ? (
-          <TopCountyTable rows={topRows} />
+          <TopCountyTable rows={topRows} initialSortKey={topSort === "score" ? "marketing_score" : "pending_pct"} />
         ) : (
           <div className="empty">No county data for this state in the current window.</div>
         )}
@@ -494,18 +522,25 @@ type CountySortKey =
   | "marketing_score"
   | "name";
 
-function TopCountyTable({ rows }: { rows: ScoredRow[] }) {
-  // Server returns rows already ranked by Pending % desc — that's the "Top 15"
-  // selection criterion. Local sort just reorders those 15.
-  const [sortKey, setSortKey] = useState<CountySortKey>("pending_pct");
+function TopCountyTable({
+  rows,
+  initialSortKey = "pending_pct"
+}: {
+  rows: ScoredRow[];
+  initialSortKey?: CountySortKey;
+}) {
+  // Server returns rows already ranked by the selected criterion. Local sort
+  // just reorders those 15. Initial sort key mirrors the server-side criterion
+  // so the table arrow matches the section heading.
+  const [sortKey, setSortKey] = useState<CountySortKey>(initialSortKey);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
 
-  // When the underlying row set changes (state picker switched), reset sort
-  // back to the server-provided "hottest" ordering.
+  // When the underlying row set changes (state picker or server-side sort
+  // criterion switched), reset local sort to match the server's ordering.
   useEffect(() => {
-    setSortKey("pending_pct");
+    setSortKey(initialSortKey);
     setSortDir("desc");
-  }, [rows]);
+  }, [rows, initialSortKey]);
 
   function toggleSort(k: CountySortKey) {
     if (k === sortKey) {
