@@ -1,25 +1,22 @@
 // app/api/refresh/route.ts
+// Triggered by Vercel Cron (Thursdays 09:00 UTC, see vercel.json) and
+// manually via `?force=1`. Compares Redfin's S3 Last-Modified against
+// what's already committed in data/dataset.json and short-circuits when
+// nothing has changed upstream.
+
 import { NextResponse } from "next/server";
-import { buildDataset, probeLastModified } from "@/lib/refresh";
+import {
+  buildDataset,
+  fetchAllSourceLastModified,
+  SOURCES,
+  type SourceMeta
+} from "@/lib/refresh";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
 
-/**
- * Refresh handler.
- *
- * Behavior:
- *   1. HEAD each upstream CSV and find the newest Last-Modified across them.
- *   2. Compare against the last successful build (stored as a sidecar file in
- *      the repo at data/.last-upstream). If unchanged AND ?force=1 is not set,
- *      skip rebuild and return early.
- *   3. Otherwise rebuild and commit to GitHub.
- *
- * Why this matters:
- *   The cron runs daily but Redfin republishes the monthlies roughly once a
- *   month. Most daily runs short-circuit at step 2, costing only the HEAD
- *   requests (~milliseconds) and producing no GitHub commit noise.
- */
+interface CommittedFile { sha: string; url: string }
+
 export async function GET(request: Request) {
   const auth = request.headers.get("authorization");
   const expected = process.env.CRON_SECRET;
@@ -31,35 +28,42 @@ export async function GET(request: Request) {
   const force = url.searchParams.get("force") === "1";
 
   try {
-    // Step 1: probe Last-Modified.
-    const probe = await probeLastModified();
-    const upstreamTag = probe.newestLastModified;
+    const upstream = await fetchAllSourceLastModified();
+    let precheckSkipped = false;
+    let previousMeta: SourceMeta | null = null;
 
-    // Step 2: skip if unchanged.
     if (!force) {
-      const lastSeen = await readLastSeenTag();
-      if (upstreamTag && lastSeen && lastSeen === upstreamTag) {
-        return NextResponse.json({
-          ok: true,
-          skipped: true,
-          reason: "upstream unchanged since last refresh",
-          upstream_last_modified: upstreamTag,
-          per_file: probe.perFile
-        });
+      previousMeta = await readCommittedSourceMeta();
+      if (previousMeta && metaMatches(previousMeta, upstream)) {
+        precheckSkipped = true;
       }
     }
 
-    // Step 3: rebuild + commit.
-    const dataset = await buildDataset();
+    if (precheckSkipped) {
+      return NextResponse.json({
+        ok: true,
+        skipped: true,
+        reason: "no upstream change since last commit",
+        per_file: upstream,
+        upstream_last_modified: maxLastMod(upstream),
+        previous_source_last_modified: previousMeta,
+        committed: null
+      });
+    }
+
+    const { dataset, source_last_modified, upstream_last_modified } =
+      await buildDataset();
     const payload = JSON.stringify(dataset);
-    const committed = await commitToGitHub(payload, upstreamTag ?? "unknown");
+    const committed = await commitToGitHub(payload);
+
     return NextResponse.json({
       ok: true,
       skipped: false,
+      forced: force,
       rows: dataset.rows.length,
       generated_at: dataset.generated_at,
-      upstream_last_modified: upstreamTag,
-      per_file: probe.perFile,
+      per_file: source_last_modified,
+      upstream_last_modified,
       committed
     });
   } catch (e: unknown) {
@@ -71,82 +75,79 @@ export async function GET(request: Request) {
   }
 }
 
-/**
- * Read the last-seen upstream Last-Modified tag we recorded. Kept as a tiny
- * sidecar file in the repo so it's durable across cold starts without
- * requiring external storage.
- */
-async function readLastSeenTag(): Promise<string | null> {
+function maxLastMod(meta: SourceMeta): string | null {
+  const ts = [meta.state, meta.county, meta.zip]
+    .filter((v): v is string => !!v)
+    .map((s) => ({ raw: s, ms: Date.parse(s) }))
+    .filter((x) => Number.isFinite(x.ms))
+    .sort((a, b) => b.ms - a.ms);
+  return ts[0]?.raw ?? null;
+}
+
+function metaMatches(a: SourceMeta, b: SourceMeta): boolean {
+  return a.state === b.state && a.county === b.county && a.zip === b.zip;
+}
+
+async function readCommittedSourceMeta(): Promise<SourceMeta | null> {
   const token = process.env.GITHUB_TOKEN;
   const repo = process.env.GITHUB_REPO;
   const branch = process.env.GITHUB_BRANCH ?? "main";
   if (!token || !repo) return null;
 
-  const path = "data/.last-upstream";
-  const apiBase = `https://api.github.com/repos/${repo}/contents/${path}?ref=${branch}`;
   try {
-    const res = await fetch(apiBase, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github+json",
-        "User-Agent": "silverstone-refresh"
+    const res = await fetch(
+      `https://raw.githubusercontent.com/${repo}/${branch}/data/dataset.json`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "User-Agent": "silverstone-refresh"
+        },
+        cache: "no-store"
       }
-    });
+    );
     if (!res.ok) return null;
-    const j = (await res.json()) as { content?: string };
-    if (!j.content) return null;
-    const decoded = Buffer.from(j.content, "base64").toString("utf-8").trim();
-    return decoded || null;
+
+    const reader = res.body?.getReader();
+    if (!reader) return null;
+    const decoder = new TextDecoder("utf-8");
+    let buf = "";
+    const cap = 8192;
+    while (buf.length < cap) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const m = buf.match(/"source_last_modified"\s*:\s*\{[^}]*\}/);
+      if (m) {
+        try {
+          const parsed = JSON.parse(`{${m[0]}}`) as {
+            source_last_modified: SourceMeta;
+          };
+          try { reader.cancel(); } catch {}
+          return parsed.source_last_modified;
+        } catch {
+          break;
+        }
+      }
+    }
+    try { reader.cancel(); } catch {}
+    return null;
   } catch {
     return null;
   }
 }
 
 async function commitToGitHub(
-  fileContent: string,
-  upstreamTag: string
-): Promise<{ sha: string; url: string } | null> {
+  fileContent: string
+): Promise<CommittedFile | null> {
   const token = process.env.GITHUB_TOKEN;
   const repo = process.env.GITHUB_REPO;
   const branch = process.env.GITHUB_BRANCH ?? "main";
-  if (!token || !repo) return null;
-
-  // First, the dataset itself.
-  const datasetResult = await putFile({
-    token,
-    repo,
-    branch,
-    path: "data/dataset.json",
-    content: fileContent,
-    message: `chore(data): refresh ${new Date().toISOString().slice(0, 10)} (upstream ${upstreamTag})`
-  });
-
-  // Then, the sidecar tag (best-effort; don't fail the whole refresh if this fails).
-  try {
-    await putFile({
-      token,
-      repo,
-      branch,
-      path: "data/.last-upstream",
-      content: upstreamTag,
-      message: `chore(data): record upstream tag ${upstreamTag}`
-    });
-  } catch (e) {
-    console.warn("sidecar tag commit failed:", (e as Error).message);
+  if (!token || !repo) {
+    console.warn("[commit] GITHUB_TOKEN/GITHUB_REPO not set - skipping");
+    return null;
   }
 
-  return datasetResult;
-}
-
-async function putFile(args: {
-  token: string;
-  repo: string;
-  branch: string;
-  path: string;
-  content: string;
-  message: string;
-}): Promise<{ sha: string; url: string } | null> {
-  const { token, repo, branch, path, content, message } = args;
+  const path = "data/dataset.json";
   const apiBase = `https://api.github.com/repos/${repo}/contents/${path}`;
 
   let currentSha: string | undefined;
@@ -163,8 +164,8 @@ async function putFile(args: {
   }
 
   const body = {
-    message,
-    content: Buffer.from(content, "utf-8").toString("base64"),
+    message: `chore(data): refresh ${new Date().toISOString().slice(0, 10)}`,
+    content: Buffer.from(fileContent, "utf-8").toString("base64"),
     branch,
     ...(currentSha ? { sha: currentSha } : {})
   };
@@ -182,11 +183,15 @@ async function putFile(args: {
 
   if (!put.ok) {
     const text = await put.text();
-    throw new Error(`GitHub commit failed (${path}): ${put.status} ${text}`);
+    throw new Error(`GitHub commit failed: ${put.status} ${text}`);
   }
 
-  const json = (await put.json()) as { content?: { sha: string; html_url: string } };
+  const json = (await put.json()) as {
+    content?: { sha: string; html_url: string };
+  };
   return json.content
     ? { sha: json.content.sha, url: json.content.html_url }
     : null;
 }
+
+void SOURCES;

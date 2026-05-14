@@ -7,6 +7,12 @@ import { scoreRow, scoreRowStatesOnly, type ScoredRow } from "./scoring";
 export interface Dataset {
   generated_at: string;
   source: string;
+  /** Per-source Last-Modified from the upstream S3 objects (set by refresh). */
+  source_last_modified?: {
+    state: string | null;
+    county: string | null;
+    zip: string | null;
+  };
   rows: MarketRow[];
 }
 
