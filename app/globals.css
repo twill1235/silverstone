@@ -466,6 +466,40 @@ table.data .state-cell {
   min-width: 220px;
 }
 
+/* SORT-CRITERION TOGGLE (Score / Pending %) */
+.top-sort-toggle {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  margin-left: auto;
+}
+.top-sort-toggle button {
+  background: var(--bg);
+  border: none;
+  padding: 8px 14px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  cursor: pointer;
+  transition: background 120ms, color 120ms;
+}
+.top-sort-toggle button:not(:last-child) { border-right: 1px solid var(--line); }
+.top-sort-toggle button:hover:not(.active) {
+  background: var(--bg-elev);
+  color: var(--ink);
+}
+.top-sort-toggle button.active {
+  background: var(--ink);
+  color: var(--bg);
+}
+
+@media (max-width: 720px) {
+  .state-picker { flex-wrap: wrap; }
+  .top-sort-toggle { margin-left: 0; width: 100%; }
+  .top-sort-toggle button { flex: 1; }
+}
+
 /* EMPTY / ERROR */
 .empty {
   padding: 32px;
