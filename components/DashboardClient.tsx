@@ -268,7 +268,7 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
         <div className="section-head">
           <span className="section-num">§ 02</span>
           <h2 className="section-title">Top 15 hottest counties by state</h2>
-          <span className="section-note">Ranked by Pending %</span>
+          <span className="section-note">Click any column to sort</span>
         </div>
         <div className="state-picker">
           <label htmlFor="top-state">State:</label>
@@ -485,24 +485,89 @@ function Metric({
 }
 
 /** Top-15 county table — ranked by Pending % desc, with supporting columns. */
+type CountySortKey =
+  | "pending_pct"
+  | "median_dom"
+  | "population"
+  | "median_sale_price"
+  | "homes_sold"
+  | "marketing_score"
+  | "name";
+
 function TopCountyTable({ rows }: { rows: ScoredRow[] }) {
+  // Server returns rows already ranked by Pending % desc — that's the "Top 15"
+  // selection criterion. Local sort just reorders those 15.
+  const [sortKey, setSortKey] = useState<CountySortKey>("pending_pct");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+
+  // When the underlying row set changes (state picker switched), reset sort
+  // back to the server-provided "hottest" ordering.
+  useEffect(() => {
+    setSortKey("pending_pct");
+    setSortDir("desc");
+  }, [rows]);
+
+  function toggleSort(k: CountySortKey) {
+    if (k === sortKey) {
+      setSortDir((d) => (d === "desc" ? "asc" : "desc"));
+    } else {
+      setSortKey(k);
+      // DOM is "lower = hotter", so default ascending. Name ascending. Others descending.
+      setSortDir(k === "median_dom" || k === "name" ? "asc" : "desc");
+    }
+  }
+
+  const sorted = useMemo(() => {
+    const arr = [...rows];
+    arr.sort((a, b) => {
+      if (sortKey === "name") {
+        const av = a.name.toLowerCase();
+        const bv = b.name.toLowerCase();
+        if (av === bv) return 0;
+        const cmp = av < bv ? -1 : 1;
+        return sortDir === "asc" ? cmp : -cmp;
+      }
+      const av = (a[sortKey] ?? 0) as number;
+      const bv = (b[sortKey] ?? 0) as number;
+      return sortDir === "desc" ? bv - av : av - bv;
+    });
+    return arr;
+  }, [rows, sortKey, sortDir]);
+
+  const arrow = (k: CountySortKey) =>
+    sortKey === k ? (sortDir === "desc" ? " ↓" : " ↑") : "";
+
   return (
     <div className="table-wrap">
       <table className="data">
         <thead>
           <tr>
             <th className="rank">#</th>
-            <th>County</th>
-            <th className="num">Pending %</th>
-            <th className="num">Avg DOM</th>
-            <th className="num">Population</th>
-            <th className="num">Avg Sale Price</th>
-            <th className="num">Homes Sold</th>
-            <th className="num">Score</th>
+            <th className="sortable" onClick={() => toggleSort("name")}>
+              County{arrow("name")}
+            </th>
+            <th className="num sortable" onClick={() => toggleSort("pending_pct")}>
+              Pending %{arrow("pending_pct")}
+            </th>
+            <th className="num sortable" onClick={() => toggleSort("median_dom")}>
+              Avg DOM{arrow("median_dom")}
+            </th>
+            <th className="num sortable" onClick={() => toggleSort("population")}>
+              Population{arrow("population")}
+            </th>
+            <th className="num sortable" onClick={() => toggleSort("median_sale_price")}>
+              Avg Sale Price{arrow("median_sale_price")}
+            </th>
+            <th className="num sortable" onClick={() => toggleSort("homes_sold")}>
+              Homes Sold{arrow("homes_sold")}
+            </th>
+            <th className="num sortable" onClick={() => toggleSort("marketing_score")}>
+              Score{arrow("marketing_score")}
+            </th>
           </tr>
         </thead>
         <tbody>
-          {rows.map((r, i) => (
+          {sorted.map((r, i) => (
             <tr key={`${r.geo_id}-${r.window}-${i}`}>
               <td className="rank">{(i + 1).toString().padStart(2, "0")}</td>
               <td className="name-cell">{r.name}</td>
