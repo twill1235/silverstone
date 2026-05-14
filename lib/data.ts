@@ -7,12 +7,6 @@ import { scoreRow, scoreRowStatesOnly, type ScoredRow } from "./scoring";
 export interface Dataset {
   generated_at: string;
   source: string;
-  /** Per-source Last-Modified from the upstream S3 objects (set by refresh). */
-  source_last_modified?: {
-    state: string | null;
-    county: string | null;
-    zip: string | null;
-  };
   rows: MarketRow[];
 }
 
@@ -75,18 +69,28 @@ export function findZip(zip: string, window: TimeWindow): ScoredRow | null {
   return rows.find((r) => r.geo_id === q) ?? null;
 }
 
+export type TopCountySort = "score" | "pending";
+
 export function topCountiesByState(
   state: string,
   window: TimeWindow,
-  limit = 15
+  limit = 15,
+  sortBy: TopCountySort = "score"
 ): ScoredRow[] {
   const s = state.trim().toUpperCase();
   if (!s) return [];
-  // Sort by pending_pct desc as default; client can re-sort.
-  return getRows("county", window)
-    .filter((r) => r.state.toUpperCase() === s)
-    .sort((a, b) => b.pending_pct - a.pending_pct)
-    .slice(0, limit);
+  const rows = getRows("county", window).filter((r) => r.state.toUpperCase() === s);
+  if (sortBy === "pending") {
+    rows.sort((a, b) => b.pending_pct - a.pending_pct);
+  } else {
+    // Default: full marketing_score (Pending % + DOM + volume blended).
+    // Tie-break by Pending % so equal-score counties still order intuitively.
+    rows.sort((a, b) => {
+      const d = b.marketing_score - a.marketing_score;
+      return d !== 0 ? d : b.pending_pct - a.pending_pct;
+    });
+  }
+  return rows.slice(0, limit);
 }
 
 export function allStates(window: TimeWindow): ScoredRow[] {
