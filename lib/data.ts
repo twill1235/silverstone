@@ -3,10 +3,12 @@ import fs from "node:fs";
 import path from "node:path";
 import type { MarketRow, TimeWindow } from "./scoring";
 import { scoreRow, scoreRowStatesOnly, type ScoredRow } from "./scoring";
+import type { SourceMeta } from "./refresh";
 
 export interface Dataset {
   generated_at: string;
   source: string;
+  source_last_modified?: SourceMeta;
   rows: MarketRow[];
 }
 
