@@ -142,19 +142,42 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
     const refreshMs = Date.parse(meta.generated_at);
     if (!Number.isFinite(asOfMs)) return null;
 
-    const now = Date.now();
-    const daysSinceData = Math.floor((now - asOfMs) / 86_400_000);
+    const now = new Date();
+    const nowMs = now.getTime();
+    const daysSinceData = Math.floor((nowMs - asOfMs) / 86_400_000);
     const daysSinceRefresh = Number.isFinite(refreshMs)
-      ? Math.floor((now - refreshMs) / 86_400_000)
+      ? Math.floor((nowMs - refreshMs) / 86_400_000)
       : null;
 
-    // Redfin pushes weekly. ≤7 days = healthy. 8-14 = noticeable but not necessarily broken.
-    // >14 = something is wrong (either Redfin paused or our pipeline is failing).
-    let level: "ok" | "warn" | "bad" = "ok";
-    if (daysSinceData > 14) level = "bad";
-    else if (daysSinceData > 7) level = "warn";
+    // Redfin's new monthly feed publishes ~3-5 days after month end.
+    // Compute the latest month-end Redfin SHOULD have published by now.
+    // - Before day 5 of current month: previous-previous month-end is the expected ceiling.
+    // - Day 5+: previous month-end is expected (Redfin window opens).
+    // - Day 8+: previous month-end is required (Redfin window closes — anything older = stale).
+    const dayOfMonth = now.getUTCDate();
+    const expectedYear = now.getUTCFullYear();
+    const expectedMonth = now.getUTCMonth(); // 0-indexed; this month
+    // Last day of PREVIOUS month = day 0 of current month
+    const prevMonthEnd = new Date(Date.UTC(expectedYear, expectedMonth, 0));
+    // Last day of MONTH BEFORE PREVIOUS = day 0 of previous month
+    const prevPrevMonthEnd = new Date(Date.UTC(expectedYear, expectedMonth - 1, 0));
 
-    return { newestAsOf, daysSinceData, daysSinceRefresh, level };
+    const expectedAsOfMs =
+      dayOfMonth >= 5 ? prevMonthEnd.getTime() : prevPrevMonthEnd.getTime();
+    const hardDeadlineMs = prevMonthEnd.getTime(); // by day 8+, must have prev month
+
+    let level: "ok" | "warn" | "bad" = "ok";
+    if (dayOfMonth >= 8 && asOfMs < hardDeadlineMs) {
+      // We're past Redfin's normal publish window and still don't have last month's data.
+      level = "bad";
+    } else if (dayOfMonth >= 5 && asOfMs < expectedAsOfMs) {
+      // Publish window is open; we should have new data soon but don't yet.
+      level = "warn";
+    }
+
+    const expectedAsOfIso = new Date(expectedAsOfMs).toISOString().slice(0, 10);
+
+    return { newestAsOf, daysSinceData, daysSinceRefresh, level, expectedAsOfIso };
   }, [meta.state_as_of, meta.county_as_of, meta.zip_as_of, meta.generated_at]);
 
   return (
@@ -187,7 +210,7 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
         </div>
       </header>
 
-      {/* FRESHNESS BANNER — only renders when data is >7 days stale */}
+      {/* FRESHNESS BANNER — fires when Redfin's publish window has opened/closed without new data */}
       {freshness && freshness.level !== "ok" && (
         <div className={`freshness-banner ${freshness.level}`}>
           <span className="fb-icon">
@@ -196,14 +219,16 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
           <div className="fb-body">
             {freshness.level === "bad" ? (
               <>
-                <strong>Data is {freshness.daysSinceData} days behind.</strong>{" "}
-                Redfin typically publishes weekly. Either the upstream feed has paused or
-                the refresh pipeline is failing — worth investigating.
+                <strong>Missing latest month.</strong>{" "}
+                Redfin should have published data through {freshness.expectedAsOfIso} by now, but
+                we&apos;re still on {freshness.newestAsOf}. The refresh pipeline may be failing —
+                worth investigating.
               </>
             ) : (
               <>
-                <strong>Data through {freshness.newestAsOf}</strong> ({freshness.daysSinceData} days old).
-                Refresh job is running but Redfin hasn&apos;t pushed newer data yet.
+                <strong>Awaiting newest month.</strong>{" "}
+                Redfin&apos;s publish window for {freshness.expectedAsOfIso} is open;
+                we&apos;re still on {freshness.newestAsOf}. Should resolve within a few days.
               </>
             )}
             <span className="fb-detail">
