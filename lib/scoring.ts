@@ -1,9 +1,9 @@
 // lib/scoring.ts
-// Marketing score: equal 1/3 weights on Pending %, DOM (sub-60 strength), Transaction Volume.
+// Marketing score: equal 1/3 weights on Pending %, DOM (sub-50 strength), Transaction Volume.
 // Thresholds per site spec:
 //   Pending %: 25%+ = Good
 //   Transaction Volume: 15,000+ = Good; 10,000–15,000 = Medium; else Low
-//   DOM sub-60: the share (0–1) of weeks in window where median DOM < 60
+//   DOM sub-50: the share (0–1) of weeks in window where median DOM < 50
 
 export type TimeWindow = "30d" | "90d" | "180d" | "1y";
 
@@ -40,7 +40,7 @@ export function scorePending(pendingPct: number): number {
 }
 
 export function scoreDom(domSub60Share: number): number {
-  // Share of weeks with DOM < 60 directly maps 0–1 → 0–100
+  // Share of weeks with DOM < 50 directly maps 0–1 → 0–100
   return Math.max(0, Math.min(100, domSub60Share * 100));
 }
 
