@@ -473,7 +473,7 @@ function FullMetricGrid({ row }: { row: ScoredRow }) {
         tier={row.pending_tier === "Good" ? "good" : "low"}
       />
       <Metric label="Avg DOM" value={row.median_dom.toFixed(0)} unit="d" />
-      <Metric label="DOM <60 share" value={(row.dom_sub60_share * 100).toFixed(0)} unit="%" />
+      <Metric label="DOM <50 share" value={(row.dom_sub60_share * 100).toFixed(0)} unit="%" />
       <Metric
         label="Homes Sold"
         value={row.homes_sold.toLocaleString()}
