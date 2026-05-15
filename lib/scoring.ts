@@ -32,11 +32,11 @@ export interface ScoredRow extends MarketRow {
 }
 
 export function scorePending(pendingPct: number): number {
-  // Linear ramp: 0% → 0, 25% → 70 (threshold for "Good"), 50%+ → 100
+  // Linear ramp: 0% → 0, 25% → 70 (threshold for "Good"), 30%+ → 100
   if (pendingPct <= 0) return 0;
-  if (pendingPct >= 50) return 100;
+  if (pendingPct >= 30) return 100;
   if (pendingPct <= 25) return (pendingPct / 25) * 70;
-  return 70 + ((pendingPct - 25) / 25) * 30;
+  return 70 + ((pendingPct - 25) / 5) * 30;
 }
 
 export function scoreDom(domSub60Share: number): number {
