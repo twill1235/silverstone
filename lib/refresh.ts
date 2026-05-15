@@ -358,7 +358,7 @@ function materializeRows(
 
     const pending_pct = pendingAvg ?? 0;
     const median_dom = domAvg ?? 0;
-    const dom_sub60_share = domAvg != null ? (domAvg < 60 ? 1 : 0) : 0;
+    const dom_sub60_share = domAvg != null ? (domAvg < 50 ? 1 : 0) : 0;
 
     const newestAsOf = s.samples[0].asOf;
     const geoId = geoType === "zip" ? s.name.replace(/[^\d]/g, "") : key;
