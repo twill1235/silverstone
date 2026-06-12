@@ -269,7 +269,9 @@ async function streamAndAggregate(
     const activeListingsNum = toNum(getCol("active_listings"));
     const soldAboveRaw = toNum(getCol("share_sold_above_original_list"));
     const medianDomNum = toNum(getCol("median_days_on_market"));
-    const medianSalePriceNum = toNum(getCol("median_sale_price"));
+    const medianSalePriceNum = toNum(
+      getCol("median_sale_price") ?? getCol("median_sale_price_nsa")
+    );
 
     const sample: Sample = {
       asOf: periodEnd,
