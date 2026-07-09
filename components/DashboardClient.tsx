@@ -149,11 +149,13 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
       ? Math.floor((nowMs - refreshMs) / 86_400_000)
       : null;
 
-    // Redfin's new monthly feed publishes ~3-5 days after month end.
-    // Compute the latest month-end Redfin SHOULD have published by now.
-    // - Before day 5 of current month: previous-previous month-end is the expected ceiling.
-    // - Day 5+: previous month-end is expected (Redfin window opens).
-    // - Day 8+: previous month-end is required (Redfin window closes — anything older = stale).
+    // Redfin's monthly geo feed publishes the prior month ~12-16 days after month end
+    // (observed: April data landed ~May 14, May data ~June 12). Model that real cadence:
+    // - Before day 12 of current month: previous-previous month-end is the expected ceiling.
+    // - Day 12+: previous month-end is expected (Redfin publish window opens).
+    // - Day 18+: previous month-end is required (window closed — anything older = genuinely stale).
+    const WARN_DAY = 12;
+    const HARD_DAY = 18;
     const dayOfMonth = now.getUTCDate();
     const expectedYear = now.getUTCFullYear();
     const expectedMonth = now.getUTCMonth(); // 0-indexed; this month
@@ -163,14 +165,14 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
     const prevPrevMonthEnd = new Date(Date.UTC(expectedYear, expectedMonth - 1, 0));
 
     const expectedAsOfMs =
-      dayOfMonth >= 5 ? prevMonthEnd.getTime() : prevPrevMonthEnd.getTime();
-    const hardDeadlineMs = prevMonthEnd.getTime(); // by day 8+, must have prev month
+      dayOfMonth >= WARN_DAY ? prevMonthEnd.getTime() : prevPrevMonthEnd.getTime();
+    const hardDeadlineMs = prevMonthEnd.getTime(); // by HARD_DAY, must have prev month
 
     let level: "ok" | "warn" | "bad" = "ok";
-    if (dayOfMonth >= 8 && asOfMs < hardDeadlineMs) {
+    if (dayOfMonth >= HARD_DAY && asOfMs < hardDeadlineMs) {
       // We're past Redfin's normal publish window and still don't have last month's data.
       level = "bad";
-    } else if (dayOfMonth >= 5 && asOfMs < expectedAsOfMs) {
+    } else if (dayOfMonth >= WARN_DAY && asOfMs < expectedAsOfMs) {
       // Publish window is open; we should have new data soon but don't yet.
       level = "warn";
     }
