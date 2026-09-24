@@ -33,7 +33,7 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
   const [zipLoading, setZipLoading] = useState(false);
   const [zipErr, setZipErr] = useState<string | null>(null);
 
-  // Top 15 counties by state
+  // All counties by state, ranked
   const [stateList, setStateList] = useState<{ code: string; name: string }[]>([]);
   const [topState, setTopState] = useState<string>("");
   const [topRows, setTopRows] = useState<ScoredRow[]>([]);
@@ -291,18 +291,19 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
 
       {/* (time-window section removed — Redfin only publishes at fixed rolling periods) */}
 
-      {/* TOP 15 BY STATE — server-selected by Score (default) or Pending % */}
+      {/* ALL COUNTIES BY STATE — ranked server-side by Score (default) or Pending % */}
       <section className="section">
         <div className="section-head">
           <span className="section-num">§ 02</span>
           <h2 className="section-title">
-            Top 15 {topSort === "score" ? "best" : "hottest"} counties by state
+            County rankings by state
+            {topRows.length ? ` — all ${topRows.length} ${topRows.length === 1 ? "county" : "counties"}` : ""}
           </h2>
           <span className="section-note">
             {topSort === "score"
-              ? "Ranked by Score (Pending % + DOM + volume)"
-              : "Ranked by Pending %"}
-            {" · click any column to re-sort"}
+              ? "Rank = position by Score (Pending % + DOM + volume)"
+              : "Rank = position by Pending %"}
+            {" · click any column to re-sort; rank stays with the county"}
           </span>
         </div>
         <div className="state-picker">
@@ -539,7 +540,7 @@ function Metric({
   );
 }
 
-/** Top-15 county table — ranked by Pending % desc, with supporting columns. */
+/** County ranking table — every county in the state, with a fixed rank by the selected criterion. */
 type CountySortKey =
   | "pending_pct"
   | "median_dom"
@@ -556,9 +557,9 @@ function TopCountyTable({
   rows: ScoredRow[];
   initialSortKey?: CountySortKey;
 }) {
-  // Server returns rows already ranked by the selected criterion. Local sort
-  // just reorders those 15. Initial sort key mirrors the server-side criterion
-  // so the table arrow matches the section heading.
+  // Server returns every county already ranked by the selected criterion.
+  // That order defines each county's rank, which stays attached to the county
+  // when the user re-sorts by another column locally.
   const [sortKey, setSortKey] = useState<CountySortKey>(initialSortKey);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
 
@@ -579,8 +580,14 @@ function TopCountyTable({
     }
   }
 
+  const ranked = useMemo(
+    () => rows.map((r, i) => ({ ...r, rank: i + 1 })),
+    [rows]
+  );
+  const rankWidth = String(rows.length).length;
+
   const sorted = useMemo(() => {
-    const arr = [...rows];
+    const arr = [...ranked];
     arr.sort((a, b) => {
       if (sortKey === "name") {
         const av = a.name.toLowerCase();
@@ -594,17 +601,17 @@ function TopCountyTable({
       return sortDir === "desc" ? bv - av : av - bv;
     });
     return arr;
-  }, [rows, sortKey, sortDir]);
+  }, [ranked, sortKey, sortDir]);
 
   const arrow = (k: CountySortKey) =>
     sortKey === k ? (sortDir === "desc" ? " ↓" : " ↑") : "";
 
   return (
-    <div className="table-wrap">
+    <div className="table-wrap table-wrap--scroll">
       <table className="data">
         <thead>
           <tr>
-            <th className="rank">#</th>
+            <th className="rank">Rank</th>
             <th className="sortable" onClick={() => toggleSort("name")}>
               County{arrow("name")}
             </th>
@@ -629,9 +636,9 @@ function TopCountyTable({
           </tr>
         </thead>
         <tbody>
-          {sorted.map((r, i) => (
-            <tr key={`${r.geo_id}-${r.window}-${i}`}>
-              <td className="rank">{(i + 1).toString().padStart(2, "0")}</td>
+          {sorted.map((r) => (
+            <tr key={`${r.geo_id}-${r.window}`}>
+              <td className="rank">{r.rank.toString().padStart(Math.max(2, rankWidth), "0")}</td>
               <td className="name-cell">{r.name}</td>
               <td className="num">{r.pending_pct.toFixed(1)}%</td>
               <td className="num">{r.median_dom.toFixed(0)}d</td>
