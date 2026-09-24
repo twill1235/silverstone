@@ -31,8 +31,11 @@ export async function GET(request: Request) {
     }
     case "topByState": {
       const sortBy = searchParams.get("sortBy") === "pending" ? "pending" : "score";
+      // Returns every county in the state, ranked. Optional ?limit=N caps it.
+      const limitParam = Number(searchParams.get("limit"));
+      const limit = Number.isFinite(limitParam) && limitParam > 0 ? limitParam : undefined;
       return NextResponse.json({
-        results: topCountiesByState(q, win, 15, sortBy)
+        results: topCountiesByState(q, win, limit, sortBy)
       });
     }
     case "allStates": {
