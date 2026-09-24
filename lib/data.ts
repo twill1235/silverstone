@@ -73,10 +73,14 @@ export function findZip(zip: string, window: TimeWindow): ScoredRow | null {
 
 export type TopCountySort = "score" | "pending";
 
+/**
+ * All counties in a state, ranked by the chosen criterion (best first).
+ * Pass `limit` to cap the list; omit it to return every county.
+ */
 export function topCountiesByState(
   state: string,
   window: TimeWindow,
-  limit = 15,
+  limit?: number,
   sortBy: TopCountySort = "score"
 ): ScoredRow[] {
   const s = state.trim().toUpperCase();
@@ -92,7 +96,7 @@ export function topCountiesByState(
       return d !== 0 ? d : b.pending_pct - a.pending_pct;
     });
   }
-  return rows.slice(0, limit);
+  return limit != null && limit > 0 ? rows.slice(0, limit) : rows;
 }
 
 export function allStates(window: TimeWindow): ScoredRow[] {
