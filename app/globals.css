@@ -386,7 +386,18 @@ table.data .rank {
   font-family: "JetBrains Mono", monospace;
   color: var(--ink-3);
   font-size: 11px;
-  width: 36px;
+  width: 44px;
+}
+/* Long tables (all counties in a state): scroll inside the box, header stays put */
+.table-wrap--scroll {
+  max-height: 640px;
+  overflow-y: auto;
+}
+.table-wrap--scroll table.data thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-elev);
 }
 table.data .num {
   font-family: "JetBrains Mono", monospace;
