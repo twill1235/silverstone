@@ -147,6 +147,10 @@ interface Sample {
   soldAboveListPct: number | null;
   medianDom: number | null;
   medianSalePrice: number | null;
+  // Redfin's all_states.csv ships BOTH a seasonally-adjusted and a
+  // non-adjusted row per state per month. The SA row has NA for
+  // MEDIAN SALE PRICE NSA, so we always prefer the NSA row.
+  seasonallyAdjusted: boolean;
 }
 
 interface Snap {
@@ -281,7 +285,9 @@ async function streamAndAggregate(
       activeListings: activeListingsNum,
       soldAboveListPct: soldAboveRaw,
       medianDom: medianDomNum,
-      medianSalePrice: medianSalePriceNum
+      medianSalePrice: medianSalePriceNum,
+      seasonallyAdjusted:
+        stripQuotes(getCol("is_seasonally_adjusted")).toLowerCase() === "true"
     };
 
     let snap = byGeo.get(key);
@@ -299,7 +305,13 @@ async function streamAndAggregate(
       for (let i = 0; i < snap.samples.length; i++) {
         const s = snap.samples[i];
         if (Math.abs(periodEndMs - s.asOfMs) < minSpacingMs) {
-          if (periodEndMs > s.asOfMs) snap.samples[i] = sample;
+          const newer = periodEndMs > s.asOfMs;
+          const samePeriod = periodEndMs === s.asOfMs;
+          // Same month: replace a seasonally-adjusted row with the
+          // non-adjusted one (which carries the sale price).
+          const preferNsa =
+            samePeriod && s.seasonallyAdjusted && !sample.seasonallyAdjusted;
+          if (newer || preferNsa) snap.samples[i] = sample;
           tooClose = true;
           break;
         }
