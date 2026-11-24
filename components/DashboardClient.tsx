@@ -1,6 +1,7 @@
 // components/DashboardClient.tsx
 "use client";
 
+import type React from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ScoredRow, TimeWindow } from "@/lib/scoring";
 import { WINDOW_LABELS } from "@/lib/scoring";
@@ -356,6 +357,8 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
           <span><strong>Pending %:</strong> pending sales ÷ inventory, 90-day avg (3 monthly snapshots, All Residential)</span>
           <span><strong>Avg DOM:</strong> median days on market, weekly blend</span>
           <span><strong>Homes Sold:</strong> shown for context · not scored</span>
+          <span><strong>New Listings / NL MoM:</strong> homes newly put up for sale (sellers entering the market), newest month, and % change vs prior month · not scored</span>
+          <span><strong>Inventory / Mo. Supply:</strong> homes for sale and months to sell them at current pace, newest month · Mo. Supply under 4 = Good, 4–6 = Average, 6+ = Bad · not scored</span>
         </div>
         {allStatesRows.length ? (
           <StatesTable rows={allStatesRows} />
@@ -467,6 +470,10 @@ function CountyResultList({
               <th className="num">Population</th>
               <th className="num">Avg Sale Price</th>
               <th className="num">Homes Sold</th>
+              <th className="num">Inventory</th>
+              <th className="num">Mo. Supply</th>
+              <th className="num">New Listings</th>
+              <th className="num">NL MoM</th>
               <th className="num">Score</th>
             </tr>
           </thead>
@@ -480,6 +487,10 @@ function CountyResultList({
                 <td className="num">{r.population != null ? r.population.toLocaleString() : "—"}</td>
                 <td className="num">{r.median_sale_price ? "$" + formatPrice(r.median_sale_price) : "—"}</td>
                 <td className="num">{r.homes_sold.toLocaleString()}</td>
+                <td className="num">{fmtInt(r.inventory)}</td>
+                <td className="num" style={mosStyle(r.months_of_supply)}>{fmtMos(r.months_of_supply)}</td>
+                <td className="num">{fmtInt(r.new_listings)}</td>
+                <td className="num" style={trendStyle(r.new_listings_mom)}>{fmtPct(r.new_listings_mom)}</td>
                 <td className="num"><ScoreBar score={r.marketing_score} /></td>
               </tr>
             ))}
@@ -508,6 +519,38 @@ function FullMetricGrid({ row }: { row: ScoredRow }) {
         tier={row.volume_tier === "Good" ? "good" : row.volume_tier === "Medium" ? "medium" : "low"}
       />
       <Metric
+        label="Inventory"
+        value={fmtInt(row.inventory)}
+      />
+      <Metric
+        label="Inventory YoY"
+        value={fmtYoy(row.inventory_yoy)}
+        unit={row.inventory_yoy != null ? "%" : undefined}
+      />
+      <Metric
+        label="Months of Supply"
+        value={row.months_of_supply != null ? row.months_of_supply.toFixed(1) : "—"}
+        unit={row.months_of_supply != null ? "mo" : undefined}
+        tier={mosTier(row.months_of_supply)?.tier}
+        tierText={mosTier(row.months_of_supply)?.text}
+      />
+      <Metric
+        label="New Listings"
+        value={fmtInt(row.new_listings)}
+      />
+      <Metric
+        label="New Listings MoM"
+        value={fmtYoy(row.new_listings_mom)}
+        unit={row.new_listings_mom != null ? "%" : undefined}
+        trend={row.new_listings_mom}
+      />
+      <Metric
+        label="New Listings YoY"
+        value={fmtYoy(row.new_listings_yoy)}
+        unit={row.new_listings_yoy != null ? "%" : undefined}
+        trend={row.new_listings_yoy}
+      />
+      <Metric
         label="Avg Sale Price"
         value={row.median_sale_price ? "$" + formatPrice(row.median_sale_price) : "—"}
       />
@@ -520,20 +563,22 @@ function FullMetricGrid({ row }: { row: ScoredRow }) {
 }
 
 function Metric({
-  label, value, unit, primary, tier
+  label, value, unit, primary, tier, trend, tierText
 }: {
   label: string; value: string | number; unit?: string;
   primary?: boolean; tier?: "good" | "medium" | "low";
+  trend?: number | null;
+  tierText?: string;
 }) {
   return (
     <div className={"metric" + (primary ? " primary" : "")}>
       <span className="label">{label}</span>
-      <span className="value">
+      <span className="value" style={trendStyle(trend)}>
         {value}{unit ? <span className="unit">{unit}</span> : null}
       </span>
       {tier && (
         <span className={`pill ${tier}`} style={{ marginTop: 4, alignSelf: "flex-start" }}>
-          {tier === "good" ? "Good" : tier === "medium" ? "Medium" : "Low"}
+          {tierText ?? (tier === "good" ? "Good" : tier === "medium" ? "Medium" : "Low")}
         </span>
       )}
     </div>
@@ -547,6 +592,10 @@ type CountySortKey =
   | "population"
   | "median_sale_price"
   | "homes_sold"
+  | "inventory"
+  | "months_of_supply"
+  | "new_listings"
+  | "new_listings_mom"
   | "marketing_score"
   | "name";
 
@@ -575,8 +624,8 @@ function TopCountyTable({
       setSortDir((d) => (d === "desc" ? "asc" : "desc"));
     } else {
       setSortKey(k);
-      // DOM is "lower = hotter", so default ascending. Name ascending. Others descending.
-      setSortDir(k === "median_dom" || k === "name" ? "asc" : "desc");
+      // DOM and Months of Supply are "lower = hotter", so default ascending. Name ascending. Others descending.
+      setSortDir(k === "median_dom" || k === "months_of_supply" || k === "name" ? "asc" : "desc");
     }
   }
 
@@ -596,8 +645,12 @@ function TopCountyTable({
         const cmp = av < bv ? -1 : 1;
         return sortDir === "asc" ? cmp : -cmp;
       }
-      const av = (a[sortKey] ?? 0) as number;
-      const bv = (b[sortKey] ?? 0) as number;
+      const av = a[sortKey] as number | null | undefined;
+      const bv = b[sortKey] as number | null | undefined;
+      // Missing values always sink to the bottom regardless of direction.
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
       return sortDir === "desc" ? bv - av : av - bv;
     });
     return arr;
@@ -630,6 +683,18 @@ function TopCountyTable({
             <th className="num sortable" onClick={() => toggleSort("homes_sold")}>
               Homes Sold{arrow("homes_sold")}
             </th>
+            <th className="num sortable" onClick={() => toggleSort("inventory")}>
+              Inventory{arrow("inventory")}
+            </th>
+            <th className="num sortable" onClick={() => toggleSort("months_of_supply")}>
+              Mo. Supply{arrow("months_of_supply")}
+            </th>
+            <th className="num sortable" onClick={() => toggleSort("new_listings")}>
+              New Listings{arrow("new_listings")}
+            </th>
+            <th className="num sortable" onClick={() => toggleSort("new_listings_mom")}>
+              NL MoM{arrow("new_listings_mom")}
+            </th>
             <th className="num sortable" onClick={() => toggleSort("marketing_score")}>
               Score{arrow("marketing_score")}
             </th>
@@ -645,6 +710,10 @@ function TopCountyTable({
               <td className="num">{r.population != null ? r.population.toLocaleString() : "—"}</td>
               <td className="num">{r.median_sale_price ? "$" + formatPrice(r.median_sale_price) : "—"}</td>
               <td className="num">{r.homes_sold.toLocaleString()}</td>
+              <td className="num">{fmtInt(r.inventory)}</td>
+              <td className="num" style={mosStyle(r.months_of_supply)}>{fmtMos(r.months_of_supply)}</td>
+              <td className="num">{fmtInt(r.new_listings)}</td>
+              <td className="num" style={trendStyle(r.new_listings_mom)}>{fmtPct(r.new_listings_mom)}</td>
               <td className="num"><ScoreBar score={r.marketing_score} /></td>
             </tr>
           ))}
@@ -660,6 +729,10 @@ type StatesSortKey =
   | "median_dom"
   | "homes_sold"
   | "median_sale_price"
+  | "inventory"
+  | "months_of_supply"
+  | "new_listings"
+  | "new_listings_mom"
   | "marketing_score"
   | "name";
 
@@ -672,8 +745,8 @@ function StatesTable({ rows }: { rows: ScoredRow[] }) {
       setSortDir((d) => (d === "desc" ? "asc" : "desc"));
     } else {
       setSortKey(k);
-      // DOM is "lower = hotter", so default ascending. Name ascending. Others descending.
-      setSortDir(k === "median_dom" || k === "name" ? "asc" : "desc");
+      // DOM and Months of Supply are "lower = hotter", so default ascending. Name ascending. Others descending.
+      setSortDir(k === "median_dom" || k === "months_of_supply" || k === "name" ? "asc" : "desc");
     }
   }
 
@@ -687,8 +760,12 @@ function StatesTable({ rows }: { rows: ScoredRow[] }) {
         const cmp = av < bv ? -1 : 1;
         return sortDir === "asc" ? cmp : -cmp;
       }
-      const av = (a[sortKey] ?? 0) as number;
-      const bv = (b[sortKey] ?? 0) as number;
+      const av = a[sortKey] as number | null | undefined;
+      const bv = b[sortKey] as number | null | undefined;
+      // Missing values always sink to the bottom regardless of direction.
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
       return sortDir === "desc" ? bv - av : av - bv;
     });
     return arr;
@@ -718,6 +795,18 @@ function StatesTable({ rows }: { rows: ScoredRow[] }) {
             <th className="num sortable" onClick={() => toggleSort("median_sale_price")}>
               Avg Sale Price{arrow("median_sale_price")}
             </th>
+            <th className="num sortable" onClick={() => toggleSort("inventory")}>
+              Inventory{arrow("inventory")}
+            </th>
+            <th className="num sortable" onClick={() => toggleSort("months_of_supply")}>
+              Mo. Supply{arrow("months_of_supply")}
+            </th>
+            <th className="num sortable" onClick={() => toggleSort("new_listings")}>
+              New Listings{arrow("new_listings")}
+            </th>
+            <th className="num sortable" onClick={() => toggleSort("new_listings_mom")}>
+              NL MoM{arrow("new_listings_mom")}
+            </th>
             <th className="num sortable" onClick={() => toggleSort("marketing_score")}>
               Score{arrow("marketing_score")}
             </th>
@@ -734,6 +823,10 @@ function StatesTable({ rows }: { rows: ScoredRow[] }) {
               <td className="num">{r.median_dom.toFixed(0)}d</td>
               <td className="num">{r.homes_sold.toLocaleString()}</td>
               <td className="num">{r.median_sale_price ? "$" + formatPrice(r.median_sale_price) : "—"}</td>
+              <td className="num">{fmtInt(r.inventory)}</td>
+              <td className="num" style={mosStyle(r.months_of_supply)}>{fmtMos(r.months_of_supply)}</td>
+              <td className="num">{fmtInt(r.new_listings)}</td>
+              <td className="num" style={trendStyle(r.new_listings_mom)}>{fmtPct(r.new_listings_mom)}</td>
               <td className="num"><ScoreBar score={r.marketing_score} /></td>
             </tr>
           ))}
@@ -753,6 +846,46 @@ function ScoreBar({ score }: { score: number }) {
       {score.toFixed(1)}
     </span>
   );
+}
+
+function fmtInt(n: number | null | undefined) {
+  return n != null ? n.toLocaleString() : "—";
+}
+
+function fmtMos(n: number | null | undefined) {
+  return n != null ? n.toFixed(1) : "—";
+}
+
+/** Months of supply tiers: under 4 = Good, 4–6 = Average, 6+ = Bad. */
+function mosTier(
+  n: number | null | undefined
+): { tier: "good" | "medium" | "low"; text: string } | undefined {
+  if (n == null) return undefined;
+  if (n < 4) return { tier: "good", text: "Good" };
+  if (n < 6) return { tier: "medium", text: "Average" };
+  return { tier: "low", text: "Bad" };
+}
+
+function mosStyle(n: number | null | undefined): React.CSSProperties | undefined {
+  const t = mosTier(n);
+  if (!t) return undefined;
+  const color = t.tier === "good" ? "var(--good)" : t.tier === "medium" ? "var(--medium)" : "var(--bad)";
+  return { color, fontWeight: 600 };
+}
+
+function fmtPct(n: number | null | undefined) {
+  return n != null ? fmtYoy(n) + "%" : "—";
+}
+
+/** Green when sellers are increasing, red when they're dropping off. */
+function trendStyle(n: number | null | undefined): React.CSSProperties | undefined {
+  if (n == null || n === 0) return undefined;
+  return { color: n > 0 ? "var(--good)" : "var(--bad)" };
+}
+
+function fmtYoy(n: number | null | undefined) {
+  if (n == null) return "—";
+  return (n > 0 ? "+" : "") + n.toFixed(1);
 }
 
 function formatPrice(n: number) {
