@@ -35,8 +35,6 @@ export const SOURCES: Record<"state" | "county" | "zip", string> = {
   zip:    `${S3_BASE}/housing_market/monthly/all_zips.csv`
 };
 
-const WINDOW_KEYS: TimeWindow[] = ["30d", "90d", "180d", "1y"];
-
 // Streaming readline lets us process the 447 MB zip file without buffering
 // it into a single string (V8's ~512 MB max-string-length would error). The
 // file is sorted by (REGION, PERIOD BEGIN DESC), so we let the snapshot
@@ -429,7 +427,12 @@ function materializeRows(
     const geoId = geoType === "zip" ? s.name.replace(/[^\d]/g, "") : key;
     const cleanedName = s.name;
 
-    for (const winKey of WINDOW_KEYS) {
+    // One row per geo. The values are identical for every time window (Redfin
+    // only publishes fixed monthly periods), so storing a copy per window just
+    // quadrupled dataset.json past GitHub's upload limit. lib/data.ts stamps
+    // the requested window onto each row at read time.
+    {
+      const winKey: TimeWindow = "90d";
       out.push({
         geo_type: geoType,
         geo_id: geoId,
