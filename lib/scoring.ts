@@ -18,6 +18,15 @@ export interface MarketRow {
   median_dom: number;           // days
   dom_sub60_share: number;      // 0–1
   homes_sold: number;           // transaction volume in window
+  // Inventory (newest monthly snapshot). Optional so older dataset.json
+  // files without these fields still load until the next cron refresh.
+  inventory?: number | null;          // homes for sale at period end
+  inventory_yoy?: number | null;      // % change vs same month last year
+  months_of_supply?: number | null;   // inventory ÷ monthly sales pace
+  // Seller activity (newest monthly snapshot).
+  new_listings?: number | null;       // homes newly listed that month
+  new_listings_mom?: number | null;   // % change vs prior month
+  new_listings_yoy?: number | null;   // % change vs same month last year
   window: TimeWindow;
   as_of: string;                // ISO date of newest week used
 }
