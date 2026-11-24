@@ -19,7 +19,14 @@ export function loadDataset(): Dataset {
   const filePath = path.join(process.cwd(), "data", "dataset.json");
   try {
     const raw = fs.readFileSync(filePath, "utf-8");
-    cache = JSON.parse(raw) as Dataset;
+    const parsed = JSON.parse(raw) as Dataset;
+    // Older dataset.json files stored 4 identical copies of every geo (one per
+    // window). Keep a single copy so both old and new files work.
+    const hasMultipleWindows = parsed.rows.some((r) => r.window !== "90d");
+    if (hasMultipleWindows) {
+      parsed.rows = parsed.rows.filter((r) => r.window === "90d");
+    }
+    cache = parsed;
     return cache;
   } catch {
     cache = { generated_at: new Date().toISOString(), source: "seed", rows: [] };
@@ -33,8 +40,8 @@ export function getRows(
 ): ScoredRow[] {
   const ds = loadDataset();
   return ds.rows
-    .filter((r) => r.geo_type === geoType && r.window === window)
-    .map(scoreRow);
+    .filter((r) => r.geo_type === geoType)
+    .map((r) => scoreRow({ ...r, window }));
 }
 
 export function findState(query: string, window: TimeWindow): ScoredRow | null {
@@ -102,8 +109,8 @@ export function topCountiesByState(
 export function allStates(window: TimeWindow): ScoredRow[] {
   const ds = loadDataset();
   return ds.rows
-    .filter((r) => r.geo_type === "state" && r.window === window)
-    .map(scoreRowStatesOnly)
+    .filter((r) => r.geo_type === "state")
+    .map((r) => scoreRowStatesOnly({ ...r, window }))
     .sort((a, b) => b.marketing_score - a.marketing_score);
 }
 
