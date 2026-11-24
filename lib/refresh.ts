@@ -147,6 +147,11 @@ interface Sample {
   soldAboveListPct: number | null;
   medianDom: number | null;
   medianSalePrice: number | null;
+  inventory: number | null;
+  inventoryYoy: number | null;
+  monthsOfSupply: number | null;
+  newListings: number | null;
+  newListingsYoy: number | null;
   // Redfin's all_states.csv ships BOTH a seasonally-adjusted and a
   // non-adjusted row per state per month. The SA row has NA for
   // MEDIAN SALE PRICE NSA, so we always prefer the NSA row.
@@ -277,6 +282,12 @@ async function streamAndAggregate(
       getCol("median_sale_price") ?? getCol("median_sale_price_nsa")
     );
 
+    const inventoryNum = toNum(getCol("inventory"));
+    const inventoryYoyNum = toNum(getCol("inventory_yoy"));
+    const monthsOfSupplyNum = toNum(getCol("months_of_supply"));
+    const newListingsNum = toNum(getCol("new_listings"));
+    const newListingsYoyNum = toNum(getCol("new_listings_yoy"));
+
     const sample: Sample = {
       asOf: periodEnd,
       asOfMs: periodEndMs,
@@ -286,6 +297,11 @@ async function streamAndAggregate(
       soldAboveListPct: soldAboveRaw,
       medianDom: medianDomNum,
       medianSalePrice: medianSalePriceNum,
+      inventory: inventoryNum,
+      inventoryYoy: inventoryYoyNum,
+      monthsOfSupply: monthsOfSupplyNum,
+      newListings: newListingsNum,
+      newListingsYoy: newListingsYoyNum,
       seasonallyAdjusted:
         stripQuotes(getCol("is_seasonally_adjusted")).toLowerCase() === "true"
     };
@@ -375,6 +391,41 @@ function materializeRows(
     const dom_sub60_share = domAvg != null ? (domAvg < 50 ? 1 : 0) : 0;
 
     const newestAsOf = s.samples[0].asOf;
+
+    // Inventory is a point-in-time stock, so use the NEWEST snapshot rather
+    // than averaging. Fall back to older snapshots if the newest is NA.
+    const latest = (pick: (x: Sample) => number | null): number | null => {
+      for (const sample of s.samples) {
+        const v = pick(sample);
+        if (v != null) return v;
+      }
+      return null;
+    };
+    const inventory = latest((x) => x.inventory);
+    const inventoryYoy = latest((x) => x.inventoryYoy);
+    const monthsOfSupply = latest((x) => x.monthsOfSupply);
+    // New listings = sellers entering the market. Newest month only, so the
+    // MoM / YoY % reflect the latest change (e.g. the holiday drop-off).
+    const newListings = latest((x) => x.newListings);
+    // Redfin only publishes NEW LISTINGS MOM on seasonally-adjusted rows,
+    // which smooth out the holiday drop we want to see. Compute raw MoM from
+    // the two newest (non-adjusted) monthly snapshots instead, as long as
+    // they're consecutive months.
+    let newListingsMom: number | null = null;
+    if (s.samples.length >= 2) {
+      const cur = s.samples[0];
+      const prev = s.samples[1];
+      const gapDays = (cur.asOfMs - prev.asOfMs) / 86_400_000;
+      if (
+        gapDays <= 35 &&
+        cur.newListings != null &&
+        prev.newListings != null &&
+        prev.newListings > 0
+      ) {
+        newListingsMom = (cur.newListings / prev.newListings - 1) * 100;
+      }
+    }
+    const newListingsYoy = latest((x) => x.newListingsYoy);
     const geoId = geoType === "zip" ? s.name.replace(/[^\d]/g, "") : key;
     const cleanedName = s.name;
 
@@ -390,6 +441,12 @@ function materializeRows(
         median_dom: round(median_dom, 1),
         dom_sub60_share,
         homes_sold: homesSoldTotal,
+        inventory: inventory != null ? Math.round(inventory) : null,
+        inventory_yoy: inventoryYoy != null ? round(inventoryYoy, 1) : null,
+        months_of_supply: monthsOfSupply != null ? round(monthsOfSupply, 1) : null,
+        new_listings: newListings != null ? Math.round(newListings) : null,
+        new_listings_mom: newListingsMom != null ? round(newListingsMom, 1) : null,
+        new_listings_yoy: newListingsYoy != null ? round(newListingsYoy, 1) : null,
         window: winKey,
         as_of: newestAsOf
       });
