@@ -188,10 +188,10 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
       {/* MASTHEAD */}
       <header className="masthead">
         <div className="mast-left">
-          <div className="mast-logo">S</div>
+          <div className="mast-logo">M</div>
           <div>
             <div className="mast-title">
-              Silverstone <em>Market Intelligence</em>
+              Market <em>Intelligence</em>
             </div>
             <div className="mast-sub">
               Disposition-focused scoring · State · County · ZIP
@@ -368,7 +368,7 @@ export default function DashboardClient({ meta }: { meta: Meta }) {
       </section>
 
       <footer className="foot">
-        <span>© Silverstone Market Intelligence · Published by Tyler Williams</span>
+        <span>© Market Intelligence · Published by Tyler Williams</span>
         <span>Source: {meta.source}</span>
       </footer>
     </div>
